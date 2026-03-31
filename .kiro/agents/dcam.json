@@ -1,0 +1,12 @@
+{
+  "name": "dcam",
+  "description": "DeltaCAT Agent Memory \u2014 persistent memory across sessions",
+  "hooks": {
+    "pre-tool-use": "hooks/dcam-pre-tool.sh"
+  },
+  "memory": {
+    "provider": "deltacat",
+    "auto_compact": true,
+    "auto_inject": true
+  }
+}
