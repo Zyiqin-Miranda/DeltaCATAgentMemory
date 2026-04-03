@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "server",
+  "dolt_database": "DeltaCATAgentMemory",
+  "project_id": "f01b2109-6bcb-4fdf-8f79-d2e5b4dbbcba"
+}
