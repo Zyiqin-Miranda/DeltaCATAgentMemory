@@ -1,15 +1,15 @@
-"""Kiro hook integration — installs hooks for auto context injection."""
+"""Kiro hook integration — installs hooks and agent instructions."""
 
 import json
 from pathlib import Path
-from typing import Optional
+
+from dcam.agent_instructions import AGENT_INSTRUCTIONS
 
 HOOK_SCRIPT = '''#!/bin/bash
-# DCAM pre-tool-use hook — auto-injects compact context
+# DCAM pre-tool-use hook — auto-indexes files before operations
 PAYLOAD=$(cat)
 TOOL_NAME=$(echo "$PAYLOAD" | jq -r '.tool_name // empty')
 
-# Auto-resolve context for file operations
 case "$TOOL_NAME" in
     Read|Write|Edit|str_replace|create)
         FILE_PATH=$(echo "$PAYLOAD" | jq -r '.tool_input.file_path // .tool_input.path // empty')
@@ -37,7 +37,7 @@ KIRO_AGENT_CONFIG = {
 
 
 def install_hooks(project_root: str = "."):
-    """Install DCAM hooks into a Kiro project."""
+    """Install DCAM hooks, agent instructions, and config into a Kiro project."""
     root = Path(project_root)
 
     # Install hook script
@@ -46,6 +46,14 @@ def install_hooks(project_root: str = "."):
     hook_path = hooks_dir / "dcam-pre-tool.sh"
     hook_path.write_text(HOOK_SCRIPT)
     hook_path.chmod(0o755)
+
+    # Install agent instructions as AGENTS.md (kiro reads this automatically)
+    agents_md = root / "AGENTS.md"
+    existing = agents_md.read_text() if agents_md.exists() else ""
+    marker = "## DCAM Compact Context Protocol"
+    if marker not in existing:
+        with open(agents_md, "a") as f:
+            f.write("\n\n" + AGENT_INSTRUCTIONS)
 
     # Install Kiro agent config
     kiro_dir = root / ".kiro" / "agents"

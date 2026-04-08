@@ -8,6 +8,7 @@ from typing import Dict, List, Optional
 import pyarrow as pa
 
 from dcam.local_catalog import LocalCatalog
+from dcam.search import SearchBackend, get_backend
 from dcam.models import (
     ChatMessage, ChatSession, ChunkType, FileChunk,
     Memory, MemoryType, MessageRole,
@@ -60,10 +61,11 @@ ALL_TABLES = {
 class DeltaStore:
     """Unified DeltaCAT table store for all DCAM data."""
 
-    def __init__(self, namespace: str = "dcam"):
+    def __init__(self, namespace: str = "dcam", search_backend: str = "bm25"):
         self.namespace = namespace
         self._counters: Dict[str, int] = {}
         self.catalog = LocalCatalog()
+        self.search = get_backend(search_backend)
         self._sync_counters()
 
     def _sync_counters(self):
@@ -230,3 +232,19 @@ class DeltaStore:
             "last_indexed": [c.last_indexed.isoformat() for c in chunks],
         }
         self._write_table("compact_chunks", pa.Table.from_pydict(data, schema=CHUNK_SCHEMA))
+
+    # --- Search ---
+
+    def search_messages(self, query: str, session_id: Optional[str] = None, limit: int = 20) -> List[ChatMessage]:
+        """Search messages using the configured search backend."""
+        msgs = self.read_messages(session_id)
+        docs = [(i, m.content) for i, m in enumerate(msgs)]
+        results = self.search.search(query, docs, limit=limit)
+        return [msgs[idx] for idx, _ in results]
+
+    def search_memories(self, query: str, limit: int = 20) -> List[Memory]:
+        """Search active memories using the configured search backend."""
+        mems = [m for m in self.read_memories() if m.active]
+        docs = [(i, m.content) for i, m in enumerate(mems)]
+        results = self.search.search(query, docs, limit=limit)
+        return [mems[idx] for idx, _ in results]
