@@ -12,6 +12,9 @@ dependencies = [
     "mcp>=1.0",
 ]
 
+[project.optional-dependencies]
+deltacat = ["deltacat"]
+
 [project.scripts]
 dcam = "dcam.cli:main"
 

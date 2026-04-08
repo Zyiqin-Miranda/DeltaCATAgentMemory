@@ -27,12 +27,12 @@ from datetime import datetime
 from dcam import bridge, compact, kiro, resolver
 from dcam.models import ChatMessage, ChatSession, Memory, MemoryType, MessageRole
 from dcam.store import DeltaStore
-def get_store(ns: str, backend: str = "bm25") -> DeltaStore:
-    return DeltaStore(namespace=ns, search_backend=backend)
+def get_store(ns: str, backend: str = "bm25", catalog: str = "local") -> DeltaStore:
+    return DeltaStore(namespace=ns, search_backend=backend, catalog_backend=catalog)
 
 
 def cmd_init(args):
-    store = get_store(args.namespace, args.search_backend)
+    store = get_store(args.namespace, args.search_backend, args.catalog)
     store.init_tables()
     hook_path, config_path = kiro.install_hooks()
     print(f"✓ DeltaCAT tables initialized (namespace: {args.namespace})")
@@ -52,7 +52,7 @@ def cmd_init(args):
 
 
 def cmd_status(args):
-    store = get_store(args.namespace, args.search_backend)
+    store = get_store(args.namespace, args.search_backend, args.catalog)
     sessions = store.read_sessions()
     chunks = store.read_chunks()
     mems = [m for m in store.read_memories() if m.active]
@@ -65,7 +65,7 @@ def cmd_status(args):
 
 
 def cmd_chat_start(args):
-    store = get_store(args.namespace, args.search_backend)
+    store = get_store(args.namespace, args.search_backend, args.catalog)
     session = ChatSession(
         session_id=str(uuid.uuid4())[:12],
         title=args.title or f"Chat {datetime.now().strftime('%Y-%m-%d %H:%M')}",
@@ -98,7 +98,7 @@ def cmd_chat_start(args):
 
 
 def cmd_chat_end(args):
-    store = get_store(args.namespace, args.search_backend)
+    store = get_store(args.namespace, args.search_backend, args.catalog)
     sessions = store.read_sessions()
     for s in sessions:
         if s.session_id == args.session_id:
@@ -129,7 +129,7 @@ def cmd_chat_end(args):
 
 
 def cmd_chat_list(args):
-    store = get_store(args.namespace, args.search_backend)
+    store = get_store(args.namespace, args.search_backend, args.catalog)
     sessions = sorted(store.read_sessions(), key=lambda s: s.started_at, reverse=True)
     for s in sessions[:args.limit]:
         ended = "active" if not s.ended_at else s.ended_at.strftime("%H:%M")
@@ -139,7 +139,7 @@ def cmd_chat_list(args):
 
 
 def cmd_chat_recall(args):
-    store = get_store(args.namespace, args.search_backend)
+    store = get_store(args.namespace, args.search_backend, args.catalog)
     msgs = sorted(store.read_messages(args.session_id), key=lambda m: m.timestamp)
     if not msgs:
         print(f"No messages for session {args.session_id}")
@@ -149,7 +149,7 @@ def cmd_chat_recall(args):
 
 
 def cmd_chat_search(args):
-    store = get_store(args.namespace, args.search_backend)
+    store = get_store(args.namespace, args.search_backend, args.catalog)
     results = store.search_messages(args.query, limit=args.limit)
     if not results:
         print(f"No results for '{args.query}'")
@@ -159,13 +159,13 @@ def cmd_chat_search(args):
 
 
 def cmd_chat_enter(args):
-    store = get_store(args.namespace, args.search_backend)
+    store = get_store(args.namespace, args.search_backend, args.catalog)
     from dcam.interactive import run_interactive
     run_interactive(store, args.session_id)
 
 
 def cmd_compact(args):
-    store = get_store(args.namespace, args.search_backend)
+    store = get_store(args.namespace, args.search_backend, args.catalog)
     if args.list:
         chunks = store.read_chunks()
         files = {}
@@ -191,7 +191,7 @@ def cmd_compact(args):
 
 
 def cmd_lookup(args):
-    store = get_store(args.namespace, args.search_backend)
+    store = get_store(args.namespace, args.search_backend, args.catalog)
     chunks = compact.lookup(store, args.symbol)
     if not chunks:
         print(f"No matches for '{args.symbol}'")
@@ -202,7 +202,7 @@ def cmd_lookup(args):
 
 
 def cmd_fetch(args):
-    store = get_store(args.namespace, args.search_backend)
+    store = get_store(args.namespace, args.search_backend, args.catalog)
     chunks = store.read_chunks()
     chunk = next((c for c in chunks if c.chunk_id == args.chunk_id), None)
     if not chunk:
@@ -214,7 +214,7 @@ def cmd_fetch(args):
 
 
 def cmd_resolve(args):
-    store = get_store(args.namespace, args.search_backend)
+    store = get_store(args.namespace, args.search_backend, args.catalog)
     ctx = resolver.resolve(store, args.message)
     if ctx:
         print(ctx)
@@ -229,7 +229,7 @@ def cmd_serve(args):
 
 def cmd_orchestrate(args):
     from dcam.orchestrator import Orchestrator
-    store = get_store(args.namespace, args.search_backend)
+    store = get_store(args.namespace, args.search_backend, args.catalog)
     orch = Orchestrator(store, poll_interval=args.interval)
     orch.run()
 
@@ -269,7 +269,7 @@ def cmd_task_ready(args):
 
 def cmd_task_plan(args):
     from dcam.orchestrator import plan_session
-    store = get_store(args.namespace, args.search_backend)
+    store = get_store(args.namespace, args.search_backend, args.catalog)
     tasks = plan_session(store, args.session_id)
     if not tasks:
         print("Failed to plan. Check session ID and kiro-cli availability.")
@@ -285,6 +285,8 @@ def main():
     p.add_argument("--namespace", default="dcam")
     p.add_argument("--search-backend", default="bm25", choices=["bm25", "substring"],
                    help="Search algorithm (default: bm25)")
+    p.add_argument("--catalog", default="local", choices=["local", "deltacat"],
+                   help="Storage backend: local (parquet) or deltacat (ACID, versioned)")
     sub = p.add_subparsers(dest="command")
 
     sub.add_parser("init")

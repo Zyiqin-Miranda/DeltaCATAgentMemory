@@ -61,12 +61,33 @@ ALL_TABLES = {
 class DeltaStore:
     """Unified DeltaCAT table store for all DCAM data."""
 
-    def __init__(self, namespace: str = "dcam", search_backend: str = "bm25"):
+    def __init__(self, namespace: str = "dcam", search_backend: str = "bm25",
+                 catalog_backend: str = "local"):
+        """
+        Args:
+            namespace: Table namespace for isolation.
+            search_backend: "bm25" or "substring".
+            catalog_backend: "local" (parquet files) or "deltacat" (ACID, versioned).
+        """
         self.namespace = namespace
         self._counters: Dict[str, int] = {}
-        self.catalog = LocalCatalog()
+        self.catalog = self._init_catalog(catalog_backend)
         self.search = get_backend(search_backend)
         self._sync_counters()
+
+    @staticmethod
+    def _init_catalog(backend: str):
+        if backend == "deltacat":
+            try:
+                from dcam.deltacat_catalog import DeltaCatCatalog
+                return DeltaCatCatalog()
+            except ImportError as e:
+                raise ImportError(
+                    f"DeltaCAT backend requires deltacat package: pip install 'dcam[deltacat]'\n"
+                    f"Error: {e}"
+                )
+        else:
+            return LocalCatalog()
 
     def _sync_counters(self):
         """Sync ID counters from existing table data to avoid collisions."""
