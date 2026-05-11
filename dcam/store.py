@@ -17,8 +17,8 @@ from dcam.models import (
 # --- Schemas ---
 
 MEMORY_SCHEMA = pa.schema([
-    ("id", pa.int64()), ("type", pa.string()), ("category", pa.string()),
-    ("topic", pa.string()), ("content", pa.string()),
+    ("id", pa.int64()), ("type", pa.string()), ("name", pa.string()),
+    ("category", pa.string()), ("topic", pa.string()), ("content", pa.string()),
     ("created_at", pa.string()), ("updated_at", pa.string()),
     ("reinforcement_count", pa.int64()), ("source_session_id", pa.string()),
     ("active", pa.bool_()),
@@ -62,21 +62,24 @@ class DeltaStore:
     """Unified DeltaCAT table store for all DCAM data."""
 
     def __init__(self, namespace: str = "dcam", search_backend: str = "bm25",
-                 catalog_backend: str = "local"):
+                 catalog_backend: str = "local", branch: str = "main"):
         """
         Args:
             namespace: Table namespace for isolation.
             search_backend: "bm25" or "substring".
-            catalog_backend: "local" (parquet files) or "deltacat" (ACID, versioned).
+            catalog_backend: "local" (flat parquet), "delta" (partitioned + versioned),
+                             "branch" (branched delta), or "deltacat" (ACID).
+            branch: Branch name for branch backend (default: main).
         """
         self.namespace = namespace
+        self.branch = branch
         self._counters: Dict[str, int] = {}
-        self.catalog = self._init_catalog(catalog_backend)
+        self.catalog = self._init_catalog(catalog_backend, branch)
         self.search = get_backend(search_backend)
         self._sync_counters()
 
     @staticmethod
-    def _init_catalog(backend: str):
+    def _init_catalog(backend: str, branch: str = "main"):
         if backend == "deltacat":
             try:
                 from dcam.deltacat_catalog import DeltaCatCatalog
@@ -86,6 +89,12 @@ class DeltaStore:
                     f"DeltaCAT backend requires deltacat package: pip install 'dcam[deltacat]'\n"
                     f"Error: {e}"
                 )
+        elif backend == "delta":
+            from dcam.delta_catalog import DeltaNativeCatalog
+            return DeltaNativeCatalog()
+        elif backend == "branch":
+            from dcam.branch_catalog import BranchCatalog
+            return BranchCatalog(branch=branch)
         else:
             return LocalCatalog()
 
@@ -116,8 +125,16 @@ class DeltaStore:
     def _read_table(self, name: str) -> Optional[pa.Table]:
         return self.catalog.read_table(self.namespace, name)
 
-    def _write_table(self, name: str, table: pa.Table, append: bool = False):
-        self.catalog.write_table(self.namespace, name, table, append=append)
+    def _write_table(self, name: str, table: pa.Table, append: bool = False,
+                     partition_col: Optional[str] = None):
+        kwargs = {"append": append}
+        if partition_col:
+            kwargs["partition_col"] = partition_col
+        try:
+            self.catalog.write_table(self.namespace, name, table, **kwargs)
+        except TypeError:
+            # Catalog doesn't support partition_col (local/deltacat)
+            self.catalog.write_table(self.namespace, name, table, append=append)
 
     # --- Memory ---
 
@@ -128,7 +145,8 @@ class DeltaStore:
         mems = []
         for i in range(t.num_rows):
             r = {c: t.column(c)[i].as_py() for c in t.column_names}
-            m = Memory(id=r["id"], type=MemoryType(r["type"]), category=r.get("category"),
+            m = Memory(id=r["id"], type=MemoryType(r["type"]), name=r.get("name"),
+                       category=r.get("category"),
                        topic=r.get("topic"), content=r["content"],
                        created_at=datetime.fromisoformat(r["created_at"]),
                        updated_at=datetime.fromisoformat(r["updated_at"]),
@@ -144,6 +162,7 @@ class DeltaStore:
             return
         data = {
             "id": [m.id for m in mems], "type": [m.type.value for m in mems],
+            "name": [m.name for m in mems],
             "category": [m.category for m in mems], "topic": [m.topic for m in mems],
             "content": [m.content for m in mems],
             "created_at": [m.created_at.isoformat() for m in mems],
@@ -182,7 +201,8 @@ class DeltaStore:
             "timestamp": [msg.timestamp.isoformat()], "metadata": [msg.metadata],
         }
         table = pa.Table.from_pydict(data, schema=MESSAGE_SCHEMA)
-        self._write_table("chat_messages", table, append=True)
+        self._write_table("chat_messages", table, append=True,
+                          partition_col="session_id")
 
     # --- Sessions ---
 
@@ -256,16 +276,86 @@ class DeltaStore:
 
     # --- Search ---
 
-    def search_messages(self, query: str, session_id: Optional[str] = None, limit: int = 20) -> List[ChatMessage]:
+    def search_messages(self, query: str, session_id: Optional[str] = None, limit: int = 1000) -> List[ChatMessage]:
         """Search messages using the configured search backend."""
         msgs = self.read_messages(session_id)
         docs = [(i, m.content) for i, m in enumerate(msgs)]
         results = self.search.search(query, docs, limit=limit)
         return [msgs[idx] for idx, _ in results]
 
-    def search_memories(self, query: str, limit: int = 20) -> List[Memory]:
+    def search_memories(self, query: str, limit: int = 1000) -> List[Memory]:
         """Search active memories using the configured search backend."""
         mems = [m for m in self.read_memories() if m.active]
         docs = [(i, m.content) for i, m in enumerate(mems)]
         results = self.search.search(query, docs, limit=limit)
         return [mems[idx] for idx, _ in results]
+
+    # --- Project Memory (cross-session) ---
+
+    def read_project_memories(self) -> List[Memory]:
+        """Read memories that persist across all sessions."""
+        return [m for m in self.read_memories() if m.active and m.type == MemoryType.PROJECT]
+
+    def add_project_memory(self, content: str, name: Optional[str] = None,
+                           topic: Optional[str] = None,
+                           category: Optional[str] = None) -> Memory:
+        """Add a cross-session project memory with an optional name for recall."""
+        mems = self.read_memories()
+        # If name exists, update instead of creating duplicate
+        if name:
+            for m in mems:
+                if m.name == name and m.active:
+                    m.content = content
+                    m.updated_at = datetime.now()
+                    m.reinforcement_count += 1
+                    self.write_memories(mems)
+                    return m
+        m = Memory(
+            id=self._next_id("memories"),
+            type=MemoryType.PROJECT,
+            name=name,
+            topic=topic,
+            category=category,
+            content=content,
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+        )
+        mems.append(m)
+        self.write_memories(mems)
+        return m
+
+    def recall_by_name(self, name: str) -> Optional[Memory]:
+        """Recall a named project memory."""
+        for m in self.read_memories():
+            if m.active and m.name == name:
+                return m
+        return None
+
+    def get_session_context(self, session_id: Optional[str] = None) -> str:
+        """Build context string from project memories + session memories.
+        
+        This is what gets injected into every new session automatically.
+        """
+        lines = []
+
+        # Always include project memories
+        project_mems = self.read_project_memories()
+        if project_mems:
+            lines.append("## Project Memory (persists across sessions)\n")
+            for m in project_mems:
+                prefix = f"[{m.topic}] " if m.topic else ""
+                lines.append(f"- {prefix}{m.content}")
+            lines.append("")
+
+        # Include session-specific memories if session given
+        if session_id:
+            session_mems = [m for m in self.read_memories()
+                           if m.active and m.source_session_id == session_id
+                           and m.type != MemoryType.PROJECT]
+            if session_mems:
+                lines.append("## Session Memory\n")
+                for m in session_mems:
+                    lines.append(f"- [{m.type.value}] {m.content}")
+                lines.append("")
+
+        return "\n".join(lines)

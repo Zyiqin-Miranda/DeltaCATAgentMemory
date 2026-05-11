@@ -28,7 +28,8 @@ _store = DeltaStore(namespace="dcam")
 @mcp.tool()
 def dcam_store_memory(content: str, type: str = "semantic",
                       topic: Optional[str] = None, category: Optional[str] = None) -> str:
-    """Store a memory for long-term recall. Types: semantic, episodic, procedural, short_term."""
+    """Store a memory for long-term recall. Types: semantic, episodic, procedural, short_term, project.
+    Use type='project' for facts that should persist across ALL sessions."""
     mems = _store.read_memories()
     m = Memory(
         id=_store._next_id("memories"),
@@ -45,7 +46,24 @@ def dcam_store_memory(content: str, type: str = "semantic",
 
 
 @mcp.tool()
-def dcam_search_memories(query: str, limit: int = 20) -> str:
+def dcam_project_memory() -> str:
+    """Get all project memories that persist across sessions.
+    These are automatically included in every new session's context."""
+    ctx = _store.get_session_context()
+    return ctx if ctx else "No project memories stored."
+
+
+@mcp.tool()
+def dcam_recall_memory(name: str) -> str:
+    """Recall a named project memory by its name handle."""
+    m = _store.recall_by_name(name)
+    if m:
+        return f"[{m.name}] {m.content}"
+    return f"No memory named '{name}'"
+
+
+@mcp.tool()
+def dcam_search_memories(query: str, limit: int = 1000) -> str:
     """Search memories by keyword using BM25 ranking."""
     results = _store.search_memories(query, limit=limit)
     if not results:
@@ -69,7 +87,7 @@ def dcam_recall(session_id: str, limit: int = 1000) -> str:
 
 
 @mcp.tool()
-def dcam_list_sessions(limit: int = 10) -> str:
+def dcam_list_sessions(limit: int = 1000) -> str:
     """List past chat sessions."""
     sessions = sorted(_store.read_sessions(), key=lambda s: s.started_at, reverse=True)[:limit]
     if not sessions:
@@ -80,7 +98,7 @@ def dcam_list_sessions(limit: int = 10) -> str:
 
 
 @mcp.tool()
-def dcam_search_history(query: str, limit: int = 50) -> str:
+def dcam_search_history(query: str, limit: int = 1000) -> str:
     """Search across all chat history using BM25 ranking."""
     results = _store.search_messages(query, limit=limit)
     if not results:
@@ -186,6 +204,27 @@ def dcam_status() -> str:
         f"Indexed: {len(set(c.file_path for c in chunks))} files, {len(chunks)} chunks\n"
         f"Beads: {'connected' if bd_available() else 'not available'}"
     )
+
+
+# --- Claude Code Integration Tools ---
+
+@mcp.tool()
+def dcam_claude_sync(project_path: Optional[str] = None) -> str:
+    """Sync Claude Code sessions to DeltaCAT storage.
+    Call this to persist the current session's conversation."""
+    from dcam import claude_code
+    synced = claude_code.sync_all_sessions(_store, project_path)
+    return f"Synced {synced} session(s)"
+
+
+@mcp.tool()
+def dcam_claude_context(sessions: int = 3, messages_per_session: int = 20) -> str:
+    """Load context from recent Claude Code sessions.
+    Use this at the start of a new session to get previous conversation context."""
+    from dcam import claude_code
+    ctx = claude_code.get_recent_context(_store, limit=sessions,
+                                         max_messages_per_session=messages_per_session)
+    return ctx if ctx else "No previous session context available."
 
 
 def run_server():

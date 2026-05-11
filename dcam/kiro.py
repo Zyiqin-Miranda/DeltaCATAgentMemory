@@ -25,14 +25,29 @@ exit 0
 KIRO_AGENT_CONFIG = {
     "name": "dcam",
     "description": "DeltaCAT Agent Memory — persistent memory across sessions",
-    "hooks": {
-        "pre-tool-use": "hooks/dcam-pre-tool.sh"
+    "mcpServers": {
+        "dcam": {
+            "command": "dcam",
+            "args": ["serve"],
+            "type": "stdio",
+        }
     },
-    "memory": {
-        "provider": "deltacat",
-        "auto_compact": True,
-        "auto_inject": True,
-    }
+    "tools": ["@builtin", "@dcam"],
+    "allowedTools": [
+        "@dcam/*",
+        "fs_read",
+        "fs_write",
+        "execute_bash",
+        "grep",
+        "glob",
+        "@*",
+    ],
+    "resources": ["file://AGENTS.md"],
+    "hooks": {
+        "preToolUse": [
+            {"command": "./hooks/dcam-pre-tool.sh"}
+        ]
+    },
 }
 
 

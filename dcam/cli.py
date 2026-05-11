@@ -20,19 +20,21 @@ Usage:
 
 import argparse
 import json
+import os
 import sys
 import uuid
 from datetime import datetime
 
-from dcam import bridge, compact, kiro, resolver
+from dcam import bridge, claude_code, compact, kiro, resolver
 from dcam.models import ChatMessage, ChatSession, Memory, MemoryType, MessageRole
 from dcam.store import DeltaStore
-def get_store(ns: str, backend: str = "bm25", catalog: str = "local") -> DeltaStore:
-    return DeltaStore(namespace=ns, search_backend=backend, catalog_backend=catalog)
+def get_store(ns: str, backend: str = "bm25", catalog: str = "local",
+              branch: str = "main") -> DeltaStore:
+    return DeltaStore(namespace=ns, search_backend=backend, catalog_backend=catalog, branch=branch)
 
 
 def cmd_init(args):
-    store = get_store(args.namespace, args.search_backend, args.catalog)
+    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"))
     store.init_tables()
     hook_path, config_path = kiro.install_hooks()
     print(f"✓ DeltaCAT tables initialized (namespace: {args.namespace})")
@@ -52,7 +54,7 @@ def cmd_init(args):
 
 
 def cmd_status(args):
-    store = get_store(args.namespace, args.search_backend, args.catalog)
+    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"))
     sessions = store.read_sessions()
     chunks = store.read_chunks()
     mems = [m for m in store.read_memories() if m.active]
@@ -65,7 +67,7 @@ def cmd_status(args):
 
 
 def cmd_chat_start(args):
-    store = get_store(args.namespace, args.search_backend, args.catalog)
+    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"))
     session = ChatSession(
         session_id=str(uuid.uuid4())[:12],
         title=args.title or f"Chat {datetime.now().strftime('%Y-%m-%d %H:%M')}",
@@ -98,7 +100,7 @@ def cmd_chat_start(args):
 
 
 def cmd_chat_end(args):
-    store = get_store(args.namespace, args.search_backend, args.catalog)
+    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"))
     sessions = store.read_sessions()
     for s in sessions:
         if s.session_id == args.session_id:
@@ -129,27 +131,32 @@ def cmd_chat_end(args):
 
 
 def cmd_chat_list(args):
-    store = get_store(args.namespace, args.search_backend, args.catalog)
+    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"))
     sessions = sorted(store.read_sessions(), key=lambda s: s.started_at, reverse=True)
+    all_msgs = store.read_messages()
     for s in sessions[:args.limit]:
+        count = sum(1 for m in all_msgs if m.session_id == s.session_id)
         ended = "active" if not s.ended_at else s.ended_at.strftime("%H:%M")
         bd = f" [bd:{s.beads_issue_id}]" if s.beads_issue_id else ""
         print(f"  {s.session_id}  {s.started_at.strftime('%Y-%m-%d %H:%M')} → {ended}  "
-              f"{s.message_count:>3} msgs  {s.title}{bd}")
+              f"{count:>3} msgs  {s.title}{bd}")
 
 
 def cmd_chat_recall(args):
-    store = get_store(args.namespace, args.search_backend, args.catalog)
+    import re
+    ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"))
     msgs = sorted(store.read_messages(args.session_id), key=lambda m: m.timestamp)
     if not msgs:
         print(f"No messages for session {args.session_id}")
         return
     for msg in msgs[-args.limit:]:
-        print(f"[{msg.timestamp.strftime('%H:%M:%S')}] {msg.role.value}: {msg.content}")
+        content = ansi_escape.sub('', msg.content).strip()
+        print(f"[{msg.timestamp.strftime('%H:%M:%S')}] {msg.role.value}: {content}")
 
 
 def cmd_chat_search(args):
-    store = get_store(args.namespace, args.search_backend, args.catalog)
+    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"))
     results = store.search_messages(args.query, limit=args.limit)
     if not results:
         print(f"No results for '{args.query}'")
@@ -159,13 +166,13 @@ def cmd_chat_search(args):
 
 
 def cmd_chat_enter(args):
-    store = get_store(args.namespace, args.search_backend, args.catalog)
+    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"))
     from dcam.interactive import run_interactive
     run_interactive(store, args.session_id)
 
 
 def cmd_compact(args):
-    store = get_store(args.namespace, args.search_backend, args.catalog)
+    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"))
     if args.list:
         chunks = store.read_chunks()
         files = {}
@@ -191,7 +198,7 @@ def cmd_compact(args):
 
 
 def cmd_lookup(args):
-    store = get_store(args.namespace, args.search_backend, args.catalog)
+    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"))
     chunks = compact.lookup(store, args.symbol)
     if not chunks:
         print(f"No matches for '{args.symbol}'")
@@ -202,7 +209,7 @@ def cmd_lookup(args):
 
 
 def cmd_fetch(args):
-    store = get_store(args.namespace, args.search_backend, args.catalog)
+    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"))
     chunks = store.read_chunks()
     chunk = next((c for c in chunks if c.chunk_id == args.chunk_id), None)
     if not chunk:
@@ -214,7 +221,7 @@ def cmd_fetch(args):
 
 
 def cmd_resolve(args):
-    store = get_store(args.namespace, args.search_backend, args.catalog)
+    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"))
     ctx = resolver.resolve(store, args.message)
     if ctx:
         print(ctx)
@@ -222,14 +229,78 @@ def cmd_resolve(args):
         print("No relevant context found.")
 
 
+def cmd_memory_add(args):
+    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"))
+    m = store.add_project_memory(args.content, name=args.name, topic=args.topic, category=args.category)
+    label = f" ({m.name})" if m.name else ""
+    print(f"Stored project memory {m.id}{label}: {m.content[:80]}")
+
+
+def cmd_memory_list(args):
+    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"))
+    mems = store.read_project_memories()
+    if not mems:
+        print("No project memories stored.")
+        return
+    for m in mems:
+        name = f"[{m.name}] " if m.name else ""
+        topic = f"({m.topic}) " if m.topic else ""
+        print(f"  {m.id:>4}  {name}{topic}{m.content[:100]}")
+
+
+def cmd_memory_recall(args):
+    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"))
+    m = store.recall_by_name(args.name)
+    if m:
+        print(m.content)
+    else:
+        print(f"No memory named '{args.name}'")
+
+
+def cmd_memory_context(args):
+    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"))
+    ctx = store.get_session_context(args.session_id)
+    if ctx:
+        print(ctx)
+    else:
+        print("No memories found.")
+
+
 def cmd_serve(args):
     from dcam.mcp_server import run_server
     run_server()
 
 
+def cmd_branch_list(args):
+    from dcam.branch_store import BranchStore
+    bs = BranchStore(namespace=args.namespace, branch="main")
+    for b in bs.meta.list_all():
+        current = " ←" if b["name"] == args.branch else ""
+        merged = " (merged)" if b.get("merged") else ""
+        print(f"  {b['name']}{merged}{current}")
+
+
+def cmd_branch_merge(args):
+    from dcam.branch_store import BranchStore
+    bs = BranchStore(namespace=args.namespace, branch=args.name)
+    count = bs.merge_to_main()
+    print(f"Merged {count} deltas from '{args.name}' → main")
+
+
+def cmd_branch_delete(args):
+    from dcam.branch_store import BranchStore
+    bs = BranchStore(namespace=args.namespace, branch=args.name)
+    if not bs.meta.branches.get(args.name, {}).get("merged"):
+        print(f"Branch '{args.name}' not merged yet. Merge first or use --force")
+        if not args.force:
+            return
+    bs.delete_branch()
+    print(f"Deleted branch '{args.name}'")
+
+
 def cmd_orchestrate(args):
     from dcam.orchestrator import Orchestrator
-    store = get_store(args.namespace, args.search_backend, args.catalog)
+    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"))
     orch = Orchestrator(store, poll_interval=args.interval)
     orch.run()
 
@@ -269,7 +340,7 @@ def cmd_task_ready(args):
 
 def cmd_task_plan(args):
     from dcam.orchestrator import plan_session
-    store = get_store(args.namespace, args.search_backend, args.catalog)
+    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"))
     tasks = plan_session(store, args.session_id)
     if not tasks:
         print("Failed to plan. Check session ID and kiro-cli availability.")
@@ -280,13 +351,124 @@ def cmd_task_plan(args):
         print(f"  {t.id}  {t.title}{dep}")
 
 
+def cmd_claude_init(args):
+    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"))
+    store.init_tables()
+    project_path = args.project or os.getcwd()
+    hook_path, settings_path = claude_code.install_claude_code_hook(
+        project_path, args.namespace, args.catalog)
+    print(f"✓ DeltaCAT tables initialized (namespace: {args.namespace})")
+    print(f"✓ Claude Code hook: {hook_path}")
+    print(f"✓ Settings updated: {settings_path}")
+    # Do initial sync
+    synced = claude_code.sync_all_sessions(store, project_path)
+    if synced:
+        print(f"✓ Synced {synced} existing sessions")
+
+
+def cmd_claude_sync(args):
+    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"))
+    store.init_tables()
+    project_path = args.project or os.getcwd()
+    if args.session_file:
+        result = claude_code.sync_session(store, args.session_file, title=args.title)
+        if result:
+            print(f"✓ Synced session {result.session_id}: {result.title}")
+        else:
+            print("No new messages to sync.")
+    else:
+        synced = claude_code.sync_all_sessions(store, project_path)
+        print(f"✓ Synced {synced} session(s)")
+
+
+def cmd_claude_list(args):
+    project_path = args.project or os.getcwd()
+    sessions = claude_code.list_sessions(project_path)
+    if not sessions:
+        print("No Claude Code sessions found.")
+        return
+    for s in sessions[:args.limit]:
+        print(f"  {s['session_id'][:12]}  {s.get('started_at', 'N/A')[:16]}  "
+              f"{s['message_count']:>3} msgs  {s['project']}")
+
+
+def cmd_claude_recall(args):
+    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"))
+    msgs = store.read_messages(args.session_id)
+    if not msgs:
+        # Try syncing first
+        project_path = args.project or os.getcwd()
+        sessions = claude_code.list_sessions(project_path)
+        match = next((s for s in sessions if s["session_id"].startswith(args.session_id)), None)
+        if match:
+            claude_code.sync_session(store, match["path"])
+            msgs = store.read_messages(match["session_id"])
+    if not msgs:
+        print(f"No messages for session {args.session_id}")
+        return
+
+    claude_args = getattr(args, "claude_args", [])
+    # Strip leading '--' separator if present
+    if claude_args and claude_args[0] == "--":
+        claude_args = claude_args[1:]
+
+    if claude_args:
+        # Build context from recalled messages and launch a claude session
+        context_lines = [f"# Recalled Session Context ({args.session_id})"]
+        context_lines.append(f"# Messages: {len(msgs)} | Showing last {min(args.limit, len(msgs))}")
+        context_lines.append("")
+        for msg in msgs[-args.limit:]:
+            role = "User" if msg.role == MessageRole.USER else "Assistant"
+            content = msg.content[:500]
+            context_lines.append(f"**{role}** [{msg.timestamp.strftime('%H:%M:%S')}]: {content}")
+            context_lines.append("")
+        context = "\n".join(context_lines)
+
+        cmd = ["claude", "--append-system-prompt", context] + claude_args
+        os.execvp("claude", cmd)
+    else:
+        # Print-only mode (original behavior)
+        for msg in msgs[-args.limit:]:
+            role = "User" if msg.role == MessageRole.USER else "Assistant"
+            content = msg.content[:200]
+            print(f"[{msg.timestamp.strftime('%H:%M:%S')}] {role}: {content}")
+            print()
+
+
+def cmd_claude_search(args):
+    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"))
+    results = store.search_messages(args.query, limit=args.limit)
+    if not results:
+        print(f"No results for '{args.query}'")
+        return
+    for msg in results:
+        role = "User" if msg.role == MessageRole.USER else "Asst"
+        print(f"  [{msg.session_id[:8]}] {role}: {msg.content[:120]}")
+
+
+def cmd_claude_context(args):
+    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"))
+    # Sync latest before showing context
+    if not args.no_sync:
+        project_path = args.project or os.getcwd()
+        claude_code.sync_all_sessions(store, project_path)
+    ctx = claude_code.get_recent_context(
+        store, limit=args.sessions, max_messages_per_session=args.messages)
+    if ctx:
+        print(ctx)
+    else:
+        print("No previous session context available.")
+
+
 def main():
     p = argparse.ArgumentParser(prog="dcam", description="DeltaCAT Agent Memory")
     p.add_argument("--namespace", default="dcam")
     p.add_argument("--search-backend", default="bm25", choices=["bm25", "substring"],
                    help="Search algorithm (default: bm25)")
-    p.add_argument("--catalog", default="local", choices=["local", "deltacat"],
-                   help="Storage backend: local (parquet) or deltacat (ACID, versioned)")
+    p.add_argument("--catalog", default="local", choices=["local", "delta", "branch", "deltacat"],
+                   help="Storage backend: local, delta, branch (branched delta), or deltacat")
+    p.add_argument("--branch", default="main",
+                   help="Branch name for branch backend (default: main)")
     sub = p.add_subparsers(dest="command")
 
     sub.add_parser("init")
@@ -296,9 +478,9 @@ def main():
     csub = chat_p.add_subparsers(dest="chat_cmd")
     s = csub.add_parser("start"); s.add_argument("--title", default=None); s.add_argument("--from", dest="from_session", default=None, help="Copy context from a previous session ID")
     e = csub.add_parser("end"); e.add_argument("session_id"); e.add_argument("--summary", default=None)
-    l = csub.add_parser("list"); l.add_argument("--limit", type=int, default=20)
+    l = csub.add_parser("list"); l.add_argument("--limit", type=int, default=1000)
     r = csub.add_parser("recall"); r.add_argument("session_id"); r.add_argument("--limit", type=int, default=1000)
-    sr = csub.add_parser("search"); sr.add_argument("query"); sr.add_argument("--limit", type=int, default=50)
+    sr = csub.add_parser("search"); sr.add_argument("query"); sr.add_argument("--limit", type=int, default=1000)
 
     enter = csub.add_parser("enter"); enter.add_argument("session_id")
 
@@ -307,6 +489,42 @@ def main():
     ft = sub.add_parser("fetch"); ft.add_argument("chunk_id", type=int)
     rv = sub.add_parser("resolve"); rv.add_argument("message")
     sub.add_parser("serve", help="Start DCAM MCP server")
+
+    # branch subcommands
+    br_p = sub.add_parser("branch", help="Branch management")
+    bsub = br_p.add_subparsers(dest="branch_cmd")
+    bsub.add_parser("list")
+    bm = bsub.add_parser("merge"); bm.add_argument("name")
+    bd = bsub.add_parser("delete"); bd.add_argument("name"); bd.add_argument("--force", action="store_true")
+
+    # memory subcommands
+    mem_p = sub.add_parser("memory", help="Project memory (cross-session)")
+    msub = mem_p.add_subparsers(dest="mem_cmd")
+    ma = msub.add_parser("add"); ma.add_argument("content"); ma.add_argument("--name", default=None); ma.add_argument("--topic", default=None); ma.add_argument("--category", default=None)
+    msub.add_parser("list")
+    mr = msub.add_parser("recall"); mr.add_argument("name")
+    mc = msub.add_parser("context"); mc.add_argument("--session-id", default=None)
+
+    # claude code subcommands
+    cc_p = sub.add_parser("claude", help="Claude Code integration")
+    ccsub = cc_p.add_subparsers(dest="claude_cmd")
+    cci = ccsub.add_parser("init", help="Initialize Claude Code <-> DCAM integration")
+    cci.add_argument("--project", default=None, help="Project path (default: cwd)")
+    ccs = ccsub.add_parser("sync", help="Sync Claude Code sessions to DCAM")
+    ccs.add_argument("--project", default=None); ccs.add_argument("--session-file", default=None)
+    ccs.add_argument("--title", default=None)
+    ccl = ccsub.add_parser("list", help="List Claude Code sessions")
+    ccl.add_argument("--project", default=None); ccl.add_argument("--limit", type=int, default=20)
+    ccr = ccsub.add_parser("recall", help="Recall a Claude Code session (pass -- followed by claude options to launch a session)")
+    ccr.add_argument("session_id"); ccr.add_argument("--project", default=None)
+    ccr.add_argument("--limit", type=int, default=50)
+    ccsr = ccsub.add_parser("search", help="Search Claude Code history")
+    ccsr.add_argument("query"); ccsr.add_argument("--limit", type=int, default=10)
+    ccctx = ccsub.add_parser("context", help="Get context from recent sessions")
+    ccctx.add_argument("--project", default=None)
+    ccctx.add_argument("--sessions", type=int, default=3, help="Number of recent sessions")
+    ccctx.add_argument("--messages", type=int, default=20, help="Messages per session")
+    ccctx.add_argument("--no-sync", action="store_true", help="Skip sync before context")
 
     # orchestrate
     orch_p = sub.add_parser("orchestrate", help="Start orchestration loop")
@@ -321,7 +539,16 @@ def main():
     tsub.add_parser("ready")
     tp = tsub.add_parser("plan"); tp.add_argument("session_id")
 
-    args = p.parse_args()
+    args, remaining = p.parse_known_args()
+
+    # Pass remaining args to claude recall as claude CLI options
+    if args.command == "claude" and getattr(args, "claude_cmd", None) == "recall":
+        args.claude_args = remaining
+    elif remaining:
+        p.error(f"unrecognized arguments: {' '.join(remaining)}")
+    else:
+        args.claude_args = []
+
     cmds = {"init": cmd_init, "status": cmd_status, "compact": cmd_compact,
             "lookup": cmd_lookup, "fetch": cmd_fetch, "resolve": cmd_resolve,
             "orchestrate": cmd_orchestrate, "serve": cmd_serve}
@@ -333,6 +560,17 @@ def main():
     elif args.command == "task":
         {"create": cmd_task_create, "list": cmd_task_list, "ready": cmd_task_ready,
          "plan": cmd_task_plan}.get(args.task_cmd, lambda _: task_p.print_help())(args)
+    elif args.command == "memory":
+        {"add": cmd_memory_add, "list": cmd_memory_list,
+         "recall": cmd_memory_recall,
+         "context": cmd_memory_context}.get(args.mem_cmd, lambda _: mem_p.print_help())(args)
+    elif args.command == "claude":
+        {"init": cmd_claude_init, "sync": cmd_claude_sync, "list": cmd_claude_list,
+         "recall": cmd_claude_recall, "search": cmd_claude_search,
+         "context": cmd_claude_context}.get(args.claude_cmd, lambda _: cc_p.print_help())(args)
+    elif args.command == "branch":
+        {"list": cmd_branch_list, "merge": cmd_branch_merge,
+         "delete": cmd_branch_delete}.get(args.branch_cmd, lambda _: br_p.print_help())(args)
     elif args.command in cmds:
         cmds[args.command](args)
     else:

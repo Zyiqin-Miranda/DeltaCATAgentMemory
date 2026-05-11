@@ -7,10 +7,11 @@ from typing import Optional
 
 
 class MemoryType(str, Enum):
-    SEMANTIC = "semantic"
-    EPISODIC = "episodic"
-    PROCEDURAL = "procedural"
-    SHORT_TERM = "short_term"
+    SEMANTIC = "semantic"        # Facts: "project uses Java 17"
+    EPISODIC = "episodic"        # Events: "fixed auth bug on Apr 3"
+    PROCEDURAL = "procedural"    # Rules: "always run tests before commit"
+    SHORT_TERM = "short_term"    # Temporary: "currently working on auth"
+    PROJECT = "project"          # Cross-session: "repo structure, team conventions"
 
 
 class MessageRole(str, Enum):
@@ -30,6 +31,7 @@ class ChunkType(str, Enum):
 class Memory:
     id: Optional[int] = None
     type: MemoryType = MemoryType.SEMANTIC
+    name: Optional[str] = None    # Named handle for recall (e.g. "java-stack")
     category: Optional[str] = None
     topic: Optional[str] = None
     content: str = ""

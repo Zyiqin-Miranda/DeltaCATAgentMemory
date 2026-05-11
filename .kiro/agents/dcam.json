@@ -1,12 +1,36 @@
 {
   "name": "dcam",
   "description": "DeltaCAT Agent Memory \u2014 persistent memory across sessions",
-  "hooks": {
-    "pre-tool-use": "hooks/dcam-pre-tool.sh"
+  "mcpServers": {
+    "dcam": {
+      "command": "dcam",
+      "args": [
+        "serve"
+      ],
+      "type": "stdio"
+    }
   },
-  "memory": {
-    "provider": "deltacat",
-    "auto_compact": true,
-    "auto_inject": true
+  "tools": [
+    "@builtin",
+    "@dcam"
+  ],
+  "allowedTools": [
+    "@dcam/*",
+    "fs_read",
+    "fs_write",
+    "execute_bash",
+    "grep",
+    "glob",
+    "@*"
+  ],
+  "resources": [
+    "file://AGENTS.md"
+  ],
+  "hooks": {
+    "preToolUse": [
+      {
+        "command": "./hooks/dcam-pre-tool.sh"
+      }
+    ]
   }
 }

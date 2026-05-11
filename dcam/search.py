@@ -11,14 +11,14 @@ class SearchBackend(ABC):
     """Base class for search backends."""
 
     @abstractmethod
-    def search(self, query: str, documents: List[Tuple[int, str]], limit: int = 20) -> List[Tuple[int, float]]:
+    def search(self, query: str, documents: List[Tuple[int, str]], limit: int = 1000) -> List[Tuple[int, float]]:
         """Search documents. Returns list of (doc_index, score) sorted by relevance."""
 
 
 class SubstringSearch(SearchBackend):
     """Simple substring matching (original behavior)."""
 
-    def search(self, query: str, documents: List[Tuple[int, str]], limit: int = 20) -> List[Tuple[int, float]]:
+    def search(self, query: str, documents: List[Tuple[int, str]], limit: int = 1000) -> List[Tuple[int, float]]:
         q = query.lower()
         results = []
         for idx, content in documents:
@@ -34,7 +34,7 @@ class BM25Search(SearchBackend):
         self.k1 = k1
         self.b = b
 
-    def search(self, query: str, documents: List[Tuple[int, str]], limit: int = 20) -> List[Tuple[int, float]]:
+    def search(self, query: str, documents: List[Tuple[int, str]], limit: int = 1000) -> List[Tuple[int, float]]:
         if not documents:
             return []
 
