@@ -63,6 +63,47 @@ class ChatSession:
     beads_issue_id: Optional[str] = None
 
 
+class DecisionStatus(str, Enum):
+    OPEN = "open"
+    DECIDED = "decided"
+    SUPERSEDED = "superseded"
+    WITHDRAWN = "withdrawn"
+
+
+@dataclass
+class Decision:
+    id: Optional[int] = None
+    title: str = ""
+    context: str = ""
+    options: str = ""           # JSON: [{"key": "A", "summary": "..."}]
+    recommended: Optional[str] = None
+    chosen: Optional[str] = None
+    rationale: Optional[str] = None
+    status: DecisionStatus = DecisionStatus.OPEN
+    supersedes_id: Optional[int] = None
+    requested_by: Optional[str] = None  # slug of asker
+    decided_by: Optional[str] = None    # "manager" / role label
+    task_id: Optional[str] = None       # bd task id
+    session_id: Optional[str] = None
+    persist_target: Optional[str] = None  # "claude" | "agents" | "both"
+    persisted_at: Optional[datetime] = None
+    created_at: datetime = field(default_factory=datetime.now)
+    decided_at: Optional[datetime] = None
+    updated_at: datetime = field(default_factory=datetime.now)
+
+
+@dataclass
+class Lesson:
+    id: Optional[int] = None
+    content: str = ""
+    category: Optional[str] = None      # "design" | "testing" | "ops" | None
+    source_slug: Optional[str] = None
+    session_id: Optional[str] = None
+    persist_target: Optional[str] = None
+    persisted_at: Optional[datetime] = None
+    created_at: datetime = field(default_factory=datetime.now)
+
+
 @dataclass
 class FileChunk:
     chunk_id: int = 0

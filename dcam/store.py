@@ -10,8 +10,8 @@ import pyarrow as pa
 from dcam.local_catalog import LocalCatalog
 from dcam.search import SearchBackend, get_backend
 from dcam.models import (
-    ChatMessage, ChatSession, ChunkType, FileChunk,
-    Memory, MemoryType, MessageRole,
+    ChatMessage, ChatSession, ChunkType, Decision, DecisionStatus, FileChunk,
+    Lesson, Memory, MemoryType, MessageRole,
 )
 
 # --- Schemas ---
@@ -49,12 +49,32 @@ FILE_SCHEMA = pa.schema([
     ("chunk_count", pa.int64()), ("last_indexed", pa.string()),
 ])
 
+DECISION_SCHEMA = pa.schema([
+    ("id", pa.int64()), ("title", pa.string()), ("context", pa.string()),
+    ("options", pa.string()), ("recommended", pa.string()),
+    ("chosen", pa.string()), ("rationale", pa.string()), ("status", pa.string()),
+    ("supersedes_id", pa.int64()), ("requested_by", pa.string()),
+    ("decided_by", pa.string()), ("task_id", pa.string()),
+    ("session_id", pa.string()), ("persist_target", pa.string()),
+    ("persisted_at", pa.string()), ("created_at", pa.string()),
+    ("decided_at", pa.string()), ("updated_at", pa.string()),
+])
+
+LESSON_SCHEMA = pa.schema([
+    ("id", pa.int64()), ("content", pa.string()), ("category", pa.string()),
+    ("source_slug", pa.string()), ("session_id", pa.string()),
+    ("persist_target", pa.string()), ("persisted_at", pa.string()),
+    ("created_at", pa.string()),
+])
+
 ALL_TABLES = {
     "memories": MEMORY_SCHEMA,
     "chat_messages": MESSAGE_SCHEMA,
     "chat_sessions": SESSION_SCHEMA,
     "compact_chunks": CHUNK_SCHEMA,
     "compact_files": FILE_SCHEMA,
+    "decisions": DECISION_SCHEMA,
+    "lessons": LESSON_SCHEMA,
 }
 
 
@@ -62,7 +82,8 @@ class DeltaStore:
     """Unified DeltaCAT table store for all DCAM data."""
 
     def __init__(self, namespace: str = "dcam", search_backend: str = "bm25",
-                 catalog_backend: str = "local", branch: str = "main"):
+                 catalog_backend: str = "local", branch: str = "main",
+                 storage_root: Optional[str] = None):
         """
         Args:
             namespace: Table namespace for isolation.
@@ -70,16 +91,25 @@ class DeltaStore:
             catalog_backend: "local" (flat parquet), "delta" (partitioned + versioned),
                              "branch" (branched delta), or "deltacat" (ACID).
             branch: Branch name for branch backend (default: main).
+            storage_root: Override the catalog's root directory. If unset,
+                resolved via dcam.project.discover_root() so a project's
+                `.dcam/` directory is auto-detected.
         """
+        from dcam.project import discover_root, is_project_root
         self.namespace = namespace
         self.branch = branch
         self._counters: Dict[str, int] = {}
-        self.catalog = self._init_catalog(catalog_backend, branch)
+        self.storage_root = discover_root(storage_root)
+        self.is_project_mode = is_project_root(self.storage_root)
+        self.catalog = self._init_catalog(catalog_backend, branch,
+                                          self.storage_root,
+                                          self.is_project_mode)
         self.search = get_backend(search_backend)
         self._sync_counters()
 
     @staticmethod
-    def _init_catalog(backend: str, branch: str = "main"):
+    def _init_catalog(backend: str, branch: str, storage_root,
+                      is_project_mode: bool):
         if backend == "deltacat":
             try:
                 from dcam.deltacat_catalog import DeltaCatCatalog
@@ -95,12 +125,20 @@ class DeltaStore:
         elif backend == "branch":
             from dcam.branch_catalog import BranchCatalog
             return BranchCatalog(branch=branch)
-        else:
-            return LocalCatalog()
+        # `local` backend, the default. Switch implementation based on
+        # whether we're in project mode (JSON-as-primary for committable
+        # tables) or the historical global mode (parquet everything).
+        if is_project_mode:
+            from dcam.json_catalog import JsonCatalog
+            return JsonCatalog(storage_root)
+        # Global mode: keep the historical layout at ~/.dcam/tables/.
+        return LocalCatalog()
 
     def _sync_counters(self):
         """Sync ID counters from existing table data to avoid collisions."""
-        for table, col in [("memories", "id"), ("chat_messages", "id"), ("compact_chunks", "chunk_id")]:
+        for table, col in [("memories", "id"), ("chat_messages", "id"),
+                           ("compact_chunks", "chunk_id"),
+                           ("decisions", "id"), ("lessons", "id")]:
             try:
                 t = self._read_table(table)
                 if t and t.num_rows > 0:
@@ -359,3 +397,137 @@ class DeltaStore:
                 lines.append("")
 
         return "\n".join(lines)
+
+    # --- Decisions ---
+
+    @staticmethod
+    def _opt_dt(s):
+        return datetime.fromisoformat(s) if s else None
+
+    def read_decisions(self, status: Optional[str] = None) -> List[Decision]:
+        t = self._read_table("decisions")
+        if not t:
+            return []
+        out: List[Decision] = []
+        for i in range(t.num_rows):
+            r = {c: t.column(c)[i].as_py() for c in t.column_names}
+            d = Decision(
+                id=r["id"], title=r.get("title") or "",
+                context=r.get("context") or "", options=r.get("options") or "",
+                recommended=r.get("recommended"), chosen=r.get("chosen"),
+                rationale=r.get("rationale"),
+                status=DecisionStatus(r.get("status") or "open"),
+                supersedes_id=r.get("supersedes_id"),
+                requested_by=r.get("requested_by"),
+                decided_by=r.get("decided_by"),
+                task_id=r.get("task_id"), session_id=r.get("session_id"),
+                persist_target=r.get("persist_target"),
+                persisted_at=self._opt_dt(r.get("persisted_at")),
+                created_at=self._opt_dt(r.get("created_at")) or datetime.now(),
+                decided_at=self._opt_dt(r.get("decided_at")),
+                updated_at=self._opt_dt(r.get("updated_at")) or datetime.now(),
+            )
+            if status and d.status.value != status:
+                continue
+            out.append(d)
+            if d.id and d.id >= self._counters.get("decisions", 0):
+                self._counters["decisions"] = d.id
+        return out
+
+    def write_decisions(self, decisions: List[Decision]):
+        if not decisions:
+            return
+        data = {
+            "id": [d.id for d in decisions],
+            "title": [d.title for d in decisions],
+            "context": [d.context for d in decisions],
+            "options": [d.options for d in decisions],
+            "recommended": [d.recommended for d in decisions],
+            "chosen": [d.chosen for d in decisions],
+            "rationale": [d.rationale for d in decisions],
+            "status": [d.status.value for d in decisions],
+            "supersedes_id": [d.supersedes_id for d in decisions],
+            "requested_by": [d.requested_by for d in decisions],
+            "decided_by": [d.decided_by for d in decisions],
+            "task_id": [d.task_id for d in decisions],
+            "session_id": [d.session_id for d in decisions],
+            "persist_target": [d.persist_target for d in decisions],
+            "persisted_at": [d.persisted_at.isoformat() if d.persisted_at else None for d in decisions],
+            "created_at": [d.created_at.isoformat() for d in decisions],
+            "decided_at": [d.decided_at.isoformat() if d.decided_at else None for d in decisions],
+            "updated_at": [d.updated_at.isoformat() for d in decisions],
+        }
+        self._write_table("decisions", pa.Table.from_pydict(data, schema=DECISION_SCHEMA))
+
+    def append_decision(self, d: Decision) -> Decision:
+        d.id = self._next_id("decisions")
+        existing = self.read_decisions()
+        existing.append(d)
+        self.write_decisions(existing)
+        return d
+
+    def update_decision(self, d: Decision):
+        all_ds = self.read_decisions()
+        for i, x in enumerate(all_ds):
+            if x.id == d.id:
+                all_ds[i] = d
+                break
+        else:
+            all_ds.append(d)
+        self.write_decisions(all_ds)
+
+    def get_decision_chain(self, decision_id: int) -> List[Decision]:
+        """Return [oldest, …, given_id] following supersedes_id pointers."""
+        by_id = {d.id: d for d in self.read_decisions()}
+        chain: List[Decision] = []
+        seen: set = set()
+        cur = by_id.get(decision_id)
+        while cur and cur.id not in seen:
+            chain.append(cur)
+            seen.add(cur.id)
+            cur = by_id.get(cur.supersedes_id) if cur.supersedes_id else None
+        return list(reversed(chain))
+
+    # --- Lessons ---
+
+    def read_lessons(self) -> List[Lesson]:
+        t = self._read_table("lessons")
+        if not t:
+            return []
+        out: List[Lesson] = []
+        for i in range(t.num_rows):
+            r = {c: t.column(c)[i].as_py() for c in t.column_names}
+            ls = Lesson(
+                id=r["id"], content=r.get("content") or "",
+                category=r.get("category"), source_slug=r.get("source_slug"),
+                session_id=r.get("session_id"),
+                persist_target=r.get("persist_target"),
+                persisted_at=self._opt_dt(r.get("persisted_at")),
+                created_at=self._opt_dt(r.get("created_at")) or datetime.now(),
+            )
+            out.append(ls)
+            if ls.id and ls.id >= self._counters.get("lessons", 0):
+                self._counters["lessons"] = ls.id
+        return out
+
+    def write_lessons(self, lessons: List[Lesson]):
+        if not lessons:
+            return
+        data = {
+            "id": [l.id for l in lessons],
+            "content": [l.content for l in lessons],
+            "category": [l.category for l in lessons],
+            "source_slug": [l.source_slug for l in lessons],
+            "session_id": [l.session_id for l in lessons],
+            "persist_target": [l.persist_target for l in lessons],
+            "persisted_at": [l.persisted_at.isoformat() if l.persisted_at else None for l in lessons],
+            "created_at": [l.created_at.isoformat() for l in lessons],
+        }
+        self._write_table("lessons", pa.Table.from_pydict(data, schema=LESSON_SCHEMA))
+
+    def append_lesson(self, l: Lesson) -> Lesson:
+        l.id = self._next_id("lessons")
+        existing = self.read_lessons()
+        existing.append(l)
+        self.write_lessons(existing)
+        return l

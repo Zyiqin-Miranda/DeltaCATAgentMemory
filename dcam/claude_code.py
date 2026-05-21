@@ -166,6 +166,17 @@ def _format_content_blocks(content: list) -> str:
     return "\n".join(text_parts)
 
 
+def _is_tool_result_message(raw_content) -> bool:
+    """A 'user' JSONL entry is a tool result (not a real prompt) when its
+    content is a list of blocks containing only tool_result entries."""
+    if not isinstance(raw_content, list) or not raw_content:
+        return False
+    return all(
+        isinstance(b, dict) and b.get("type") == "tool_result"
+        for b in raw_content
+    )
+
+
 def parse_session(jsonl_path: str) -> Tuple[List[ChatMessage], Dict]:
     """Parse a Claude Code JSONL session file into ChatMessage objects.
 
@@ -195,11 +206,15 @@ def parse_session(jsonl_path: str) -> Tuple[List[ChatMessage], Dict]:
     for obj in path:
         msg_type = obj.get("type")
         msg = obj.get("message", {})
-        content = msg.get("content", "")
+        raw_content = msg.get("content", "")
 
-        if isinstance(content, list):
-            content = _format_content_blocks(content)
-        elif not isinstance(content, str):
+        is_tool_result = _is_tool_result_message(raw_content)
+
+        if isinstance(raw_content, list):
+            content = _format_content_blocks(raw_content)
+        elif isinstance(raw_content, str):
+            content = raw_content
+        else:
             continue
 
         if not content or len(content.strip()) < 2:
@@ -232,6 +247,7 @@ def parse_session(jsonl_path: str) -> Tuple[List[ChatMessage], Dict]:
                 "source": "claude-code",
                 "uuid": obj.get("uuid"),
                 "version": obj.get("version"),
+                "is_tool_result": is_tool_result,
             }),
         ))
 
@@ -276,9 +292,6 @@ def sync_session(store: DeltaStore, jsonl_path: str,
             continue
         new_messages.append(msg)
 
-    if not new_messages and existing_msgs:
-        return None
-
     for msg in new_messages:
         msg.session_id = session_id
         store.append_message(msg)
@@ -287,6 +300,17 @@ def sync_session(store: DeltaStore, jsonl_path: str,
     sessions = store.read_sessions()
     existing_session = next((s for s in sessions if s.session_id == session_id), None)
     total_count = len(existing_msgs) + len(new_messages)
+
+    # Even if no new messages were added, fall through to refresh title/summary
+    # so improvements to inference logic apply on resync.
+    if not new_messages and existing_session:
+        existing_session.title = title or existing_session.title or _infer_title(messages)
+        existing_session.summary = _generate_summary(messages)
+        store.write_sessions(sessions)
+        return existing_session
+
+    if not new_messages:
+        return None
 
     if not existing_session:
         session = ChatSession(
@@ -303,6 +327,9 @@ def sync_session(store: DeltaStore, jsonl_path: str,
     else:
         existing_session.ended_at = messages[-1].timestamp
         existing_session.message_count = total_count
+        # Refresh title/summary so improvements to inference logic apply on resync
+        existing_session.title = title or _infer_title(messages)
+        existing_session.summary = _generate_summary(messages)
         store.write_sessions(sessions)
         return existing_session
 
@@ -342,8 +369,12 @@ def get_recent_context(store: DeltaStore, limit: int = 3,
     for session in sessions[:limit]:
         lines.append(f"## Session: {session.title or session.session_id}")
         lines.append(f"Date: {session.started_at.strftime('%Y-%m-%d %H:%M')}")
+        lines.append(f"ID: {session.session_id}")
         if session.summary:
-            lines.append(f"Summary: {session.summary}")
+            lines.append("")
+            lines.append("### Summary")
+            for s_line in session.summary.split("\n"):
+                lines.append(f"  {s_line}" if s_line else "")
         lines.append("")
 
         msgs = store.read_messages(session.session_id)
@@ -448,16 +479,28 @@ Commands available:
     return str(hook_path), str(settings_path)
 
 
+def _is_real_user_prompt(msg: ChatMessage) -> bool:
+    """True if the message is a real user-typed prompt, not a tool result."""
+    if msg.role != MessageRole.USER:
+        return False
+    content = msg.content.strip()
+    if not content or content.startswith("<") or content.startswith("["):
+        return False
+    if msg.metadata:
+        try:
+            if json.loads(msg.metadata).get("is_tool_result"):
+                return False
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return True
+
+
 def _infer_title(messages: List[ChatMessage]) -> str:
     """Infer a session title from the first meaningful user message."""
     for msg in messages:
-        if msg.role != MessageRole.USER:
+        if not _is_real_user_prompt(msg):
             continue
         content = msg.content.strip()
-        # Skip tool results, commands, and system messages
-        if not content or content.startswith("<") or content.startswith("["):
-            continue
-        # Skip short tool outputs (e.g. "OK", "Done")
         if len(content) < 10:
             continue
         title = content[:60].strip()
@@ -468,16 +511,133 @@ def _infer_title(messages: List[ChatMessage]) -> str:
     return "Claude Code Session"
 
 
-def _generate_summary(messages: List[ChatMessage]) -> str:
-    """Generate a brief summary from message content."""
-    user_msgs = [m for m in messages if m.role == MessageRole.USER and not m.content.startswith("<")]
-    if not user_msgs:
+_TOOL_FILE_RE = re.compile(r"\[(?:Read|Edit|Write|NotebookEdit): ([^\]\n]+)\]")
+_TOOL_BASH_RE = re.compile(r"\[Bash: ([^\]\n]{1,200})\]")
+_TOOL_AGENT_RE = re.compile(r"\[Agent: ([^\]\n]+)\]")
+_URL_RE = re.compile(r"https?://[^\s)\]>'\"]+")
+_TICKET_RE = re.compile(r"\b(?:CR-\d{4,}|SIM-[A-Za-z0-9]+|V\d{6,})\b")
+_ERROR_LINE_RE = re.compile(
+    r"^.{0,200}?(?:BUILD FAILED|Traceback \(most recent call last\)|Permission denied|"
+    r"\bSyntaxError\b|\bModuleNotFoundError\b|\bImportError\b|\bAttributeError\b|"
+    r"\bTypeError\b|\bValueError\b|\bKeyError\b|\bRuntimeError\b|"
+    r"^\s*(?:error|fatal|exception):\s+\S).{0,200}",
+    re.MULTILINE,
+)
+
+
+def _extract_session_summary(messages: List[ChatMessage]) -> Dict[str, list]:
+    """Heuristically extract structured fields from a session transcript.
+
+    All extraction is deterministic regex/keyword matching — no LLM. Captures
+    files touched, commands run, URLs, tickets/CRs, errors, and the bookend
+    user prompts. Returns a dict with list values for each field; empty lists
+    mean nothing was found.
+    """
+    files: List[str] = []
+    commands: List[str] = []
+    agents: List[str] = []
+    urls: List[str] = []
+    tickets: List[str] = []
+    errors: List[str] = []
+    user_prompts: List[str] = []
+
+    seen_files: set = set()
+    seen_commands: set = set()
+    seen_agents: set = set()
+    seen_urls: set = set()
+    seen_tickets: set = set()
+    seen_errors: set = set()
+
+    for msg in messages:
+        content = msg.content or ""
+
+        for fp in _TOOL_FILE_RE.findall(content):
+            fp = fp.strip()
+            if fp and fp not in seen_files:
+                seen_files.add(fp)
+                files.append(fp)
+
+        for cmd in _TOOL_BASH_RE.findall(content):
+            cmd = cmd.strip()
+            head = cmd.split("&&")[0].split("|")[0].strip()[:80]
+            if head and head not in seen_commands:
+                seen_commands.add(head)
+                commands.append(head)
+
+        for desc in _TOOL_AGENT_RE.findall(content):
+            desc = desc.strip()
+            if desc and desc not in seen_agents:
+                seen_agents.add(desc)
+                agents.append(desc)
+
+        for url in _URL_RE.findall(content):
+            if url not in seen_urls:
+                seen_urls.add(url)
+                urls.append(url)
+
+        for tkt in _TICKET_RE.findall(content):
+            if tkt not in seen_tickets:
+                seen_tickets.add(tkt)
+                tickets.append(tkt)
+
+        # Errors come from tool output (user-role messages tagged is_tool_result).
+        # Skip assistant text and real user prompts to avoid lifting prose like
+        # "BUILD FAILED" from chat content.
+        if msg.role == MessageRole.USER and not _is_real_user_prompt(msg):
+            for line in _ERROR_LINE_RE.findall(content):
+                err = line.strip()[:160]
+                if not err or err in seen_errors:
+                    continue
+                # Skip markdown table rows
+                if err.startswith("|") or "|" in err and err.count("|") >= 3:
+                    continue
+                seen_errors.add(err)
+                errors.append(err)
+
+        if _is_real_user_prompt(msg):
+            text = content.strip().split("\n", 1)[0][:200]
+            if text:
+                user_prompts.append(text)
+
+    return {
+        "first_prompt": [user_prompts[0]] if user_prompts else [],
+        "last_prompt": [user_prompts[-1]] if user_prompts else [],
+        "files": files[:20],
+        "commands": commands[:15],
+        "agents": agents[:10],
+        "urls": urls[:10],
+        "tickets": tickets[:10],
+        "errors": errors[:5],
+    }
+
+
+def _render_summary(summary: Dict[str, list]) -> str:
+    """Render a structured summary dict as a compact multi-line string.
+
+    Designed for direct display in `dcam claude context` and storage in the
+    sessions table's summary column. Empty fields are omitted.
+    """
+    if not summary:
         return ""
-    topics = []
-    for msg in user_msgs[:5]:
-        topic = msg.content[:100].strip()
-        if topic:
-            topics.append(topic)
-    if topics:
-        return f"Topics: {'; '.join(topics[:3])}"
-    return ""
+    sections: List[str] = []
+
+    def add(label: str, items: list, joiner: str = ", "):
+        if items:
+            sections.append(f"{label}: {joiner.join(items)}")
+
+    if summary.get("first_prompt"):
+        add("First prompt", summary["first_prompt"])
+    if summary.get("last_prompt") and summary.get("last_prompt") != summary.get("first_prompt"):
+        add("Last prompt", summary["last_prompt"])
+    add("Files", summary.get("files", []))
+    add("Commands", summary.get("commands", []))
+    add("Agents", summary.get("agents", []))
+    add("URLs", summary.get("urls", []))
+    add("Tickets", summary.get("tickets", []))
+    add("Errors", summary.get("errors", []), joiner=" | ")
+    return "\n".join(sections)
+
+
+def _generate_summary(messages: List[ChatMessage]) -> str:
+    """Generate a structured heuristic summary from message content."""
+    return _render_summary(_extract_session_summary(messages))

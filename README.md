@@ -15,7 +15,8 @@ AI chat sessions are ephemeral — when you close a chat, all context is lost. Y
 - **Code index** — files summarized into compact chunks, fetched on demand instead of loading full files into context
 - **Task tracking** — sessions linked to Beads issues for persistent task graphs
 - **MCP server** — 15 native tools for AI assistants via Model Context Protocol
-- **Multi-agent orchestration** — task decomposition and dispatch via beads dependency graph
+- **Multi-agent orchestration** — task decomposition and dispatch via beads dependency graph; full manager / dev / reviewer workflow over tmux documented in [TMUX.md](TMUX.md)
+- **Project mode** — opt-in `<repo>/.dcam/` directory with JSON-as-primary storage so decisions, lessons, and session summaries are committed and reviewable in PRs alongside source code (see [TMUX.md § Project mode](TMUX.md#project-mode-committing-memory-alongside-code))
 - **Delta storage** — partitioned, append-only deltas with compaction and time-travel
 
 ## Install

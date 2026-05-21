@@ -29,12 +29,74 @@ from dcam import bridge, claude_code, compact, kiro, resolver
 from dcam.models import ChatMessage, ChatSession, Memory, MemoryType, MessageRole
 from dcam.store import DeltaStore
 def get_store(ns: str, backend: str = "bm25", catalog: str = "local",
-              branch: str = "main") -> DeltaStore:
-    return DeltaStore(namespace=ns, search_backend=backend, catalog_backend=catalog, branch=branch)
+              branch: str = "main", storage_root: str = None) -> DeltaStore:
+    return DeltaStore(namespace=ns, search_backend=backend,
+                      catalog_backend=catalog, branch=branch,
+                      storage_root=storage_root)
+
+
+_GLOBAL_FLAGS_WITH_VALUE = {"--namespace", "--search-backend", "--catalog",
+                            "--branch", "--root"}
+
+
+def _hoist_global_flags(argv):
+    """Move global flags (--namespace, --catalog, etc.) to the front of argv.
+
+    argparse only recognizes options on the parser they're attached to, and
+    global options on the top-level parser must appear before the subcommand.
+    Users naturally write `dcam claude context --catalog local`, so we
+    transparently hoist those flags to the front before parse_known_args.
+
+    Tokens after a bare `--` separator are left untouched so passthrough args
+    (e.g. `dcam claude recall ID -- --resume`) keep their meaning.
+    """
+    out_front = []
+    rest = []
+    i = 0
+    while i < len(argv):
+        token = argv[i]
+        if token == "--":
+            rest.extend(argv[i:])
+            break
+        # Handle "--flag=value" form
+        if any(token.startswith(f + "=") for f in _GLOBAL_FLAGS_WITH_VALUE):
+            out_front.append(token)
+            i += 1
+            continue
+        # Handle "--flag value" form
+        if token in _GLOBAL_FLAGS_WITH_VALUE and i + 1 < len(argv):
+            out_front.extend([token, argv[i + 1]])
+            i += 2
+            continue
+        rest.append(token)
+        i += 1
+    return out_front + rest
+
+
+def _resolve_session_prefix(store: DeltaStore, prefix: str):
+    """Resolve a session_id prefix to a full session_id from stored sessions.
+
+    Returns None if no match. If the prefix is already a full match, returns it
+    as-is. If multiple sessions match, prints an error and returns None.
+    """
+    if not prefix:
+        return None
+    sessions = store.read_sessions()
+    matches = [s.session_id for s in sessions if s.session_id == prefix]
+    if matches:
+        return matches[0]
+    matches = [s.session_id for s in sessions if s.session_id.startswith(prefix)]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        print(f"Ambiguous session prefix '{prefix}', matches: {', '.join(m[:12] for m in matches)}",
+              file=sys.stderr)
+        return None
+    return None
 
 
 def cmd_init(args):
-    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"))
+    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"), getattr(args, "root", None))
     store.init_tables()
     hook_path, config_path = kiro.install_hooks()
     print(f"✓ DeltaCAT tables initialized (namespace: {args.namespace})")
@@ -54,7 +116,7 @@ def cmd_init(args):
 
 
 def cmd_status(args):
-    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"))
+    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"), getattr(args, "root", None))
     sessions = store.read_sessions()
     chunks = store.read_chunks()
     mems = [m for m in store.read_memories() if m.active]
@@ -67,7 +129,7 @@ def cmd_status(args):
 
 
 def cmd_chat_start(args):
-    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"))
+    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"), getattr(args, "root", None))
     session = ChatSession(
         session_id=str(uuid.uuid4())[:12],
         title=args.title or f"Chat {datetime.now().strftime('%Y-%m-%d %H:%M')}",
@@ -100,7 +162,7 @@ def cmd_chat_start(args):
 
 
 def cmd_chat_end(args):
-    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"))
+    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"), getattr(args, "root", None))
     sessions = store.read_sessions()
     for s in sessions:
         if s.session_id == args.session_id:
@@ -131,7 +193,7 @@ def cmd_chat_end(args):
 
 
 def cmd_chat_list(args):
-    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"))
+    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"), getattr(args, "root", None))
     sessions = sorted(store.read_sessions(), key=lambda s: s.started_at, reverse=True)
     all_msgs = store.read_messages()
     for s in sessions[:args.limit]:
@@ -145,7 +207,10 @@ def cmd_chat_list(args):
 def cmd_chat_recall(args):
     import re
     ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
-    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"))
+    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"), getattr(args, "root", None))
+    full_session_id = _resolve_session_prefix(store, args.session_id)
+    if full_session_id:
+        args.session_id = full_session_id
     msgs = sorted(store.read_messages(args.session_id), key=lambda m: m.timestamp)
     if not msgs:
         print(f"No messages for session {args.session_id}")
@@ -156,7 +221,7 @@ def cmd_chat_recall(args):
 
 
 def cmd_chat_search(args):
-    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"))
+    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"), getattr(args, "root", None))
     results = store.search_messages(args.query, limit=args.limit)
     if not results:
         print(f"No results for '{args.query}'")
@@ -166,13 +231,13 @@ def cmd_chat_search(args):
 
 
 def cmd_chat_enter(args):
-    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"))
+    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"), getattr(args, "root", None))
     from dcam.interactive import run_interactive
     run_interactive(store, args.session_id)
 
 
 def cmd_compact(args):
-    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"))
+    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"), getattr(args, "root", None))
     if args.list:
         chunks = store.read_chunks()
         files = {}
@@ -198,7 +263,7 @@ def cmd_compact(args):
 
 
 def cmd_lookup(args):
-    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"))
+    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"), getattr(args, "root", None))
     chunks = compact.lookup(store, args.symbol)
     if not chunks:
         print(f"No matches for '{args.symbol}'")
@@ -209,7 +274,7 @@ def cmd_lookup(args):
 
 
 def cmd_fetch(args):
-    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"))
+    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"), getattr(args, "root", None))
     chunks = store.read_chunks()
     chunk = next((c for c in chunks if c.chunk_id == args.chunk_id), None)
     if not chunk:
@@ -221,7 +286,7 @@ def cmd_fetch(args):
 
 
 def cmd_resolve(args):
-    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"))
+    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"), getattr(args, "root", None))
     ctx = resolver.resolve(store, args.message)
     if ctx:
         print(ctx)
@@ -230,14 +295,14 @@ def cmd_resolve(args):
 
 
 def cmd_memory_add(args):
-    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"))
+    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"), getattr(args, "root", None))
     m = store.add_project_memory(args.content, name=args.name, topic=args.topic, category=args.category)
     label = f" ({m.name})" if m.name else ""
     print(f"Stored project memory {m.id}{label}: {m.content[:80]}")
 
 
 def cmd_memory_list(args):
-    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"))
+    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"), getattr(args, "root", None))
     mems = store.read_project_memories()
     if not mems:
         print("No project memories stored.")
@@ -249,7 +314,7 @@ def cmd_memory_list(args):
 
 
 def cmd_memory_recall(args):
-    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"))
+    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"), getattr(args, "root", None))
     m = store.recall_by_name(args.name)
     if m:
         print(m.content)
@@ -258,7 +323,7 @@ def cmd_memory_recall(args):
 
 
 def cmd_memory_context(args):
-    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"))
+    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"), getattr(args, "root", None))
     ctx = store.get_session_context(args.session_id)
     if ctx:
         print(ctx)
@@ -300,9 +365,271 @@ def cmd_branch_delete(args):
 
 def cmd_orchestrate(args):
     from dcam.orchestrator import Orchestrator
-    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"))
+    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"), getattr(args, "root", None))
     orch = Orchestrator(store, poll_interval=args.interval)
     orch.run()
+
+
+def cmd_tmux_start(args):
+    from dcam import tmux
+    project_path = args.project or os.getcwd()
+    cmd = tmux.build_manager_launch_cmd(args.claude_bin) if args.launch else None
+    name = tmux.start_session(args.session, project_path, manager_cmd=cmd)
+    print(f"✓ tmux session '{name}' ready (window: manager)")
+    if not args.launch:
+        print(f"  To start the manager agent: tmux send-keys -t {name}:manager "
+              f"'{tmux.build_manager_launch_cmd(args.claude_bin)}' Enter")
+    print(f"  Attach with: tmux attach -t {name}")
+
+
+def cmd_tmux_dev(args):
+    from dcam import tmux
+    from dcam.orchestrator import create_task
+
+    project_path = args.project or os.getcwd()
+    slug = tmux.slugify(args.slug)
+    brief = args.brief
+
+    # Create a beads task so queue mode + spawn mode share one source of truth
+    task = None
+    if not args.no_task:
+        task = create_task(
+            f"[dev:{slug}] {brief[:60]}",
+            priority=args.priority,
+            labels=[f"role:dev", f"slug:{slug}"],
+        )
+
+    cmd = tmux.build_dev_launch_cmd(slug, brief, args.claude_bin) if args.launch else None
+    target = tmux.spawn_dev_window(args.session, slug, project_path, dev_cmd=cmd)
+    print(f"✓ dev window '{target}' ready")
+    if task:
+        print(f"  Task: {task.id} (label slug:{slug})")
+    if not args.launch:
+        print(f"  To start the dev agent: tmux send-keys -t {target} "
+              f"'{tmux.build_dev_launch_cmd(slug, brief, args.claude_bin)}' Enter")
+
+
+def cmd_tmux_review(args):
+    from dcam import tmux
+
+    project_path = args.project or os.getcwd()
+    cmd = tmux.build_reviewer_launch_cmd(args.claude_bin) if args.launch else None
+    target = tmux.spawn_review_window(args.session, project_path, review_cmd=cmd)
+    print(f"✓ review window '{target}' ready")
+    if not args.launch:
+        print(f"  To start the reviewer: tmux send-keys -t {target} "
+              f"'{tmux.build_reviewer_launch_cmd(args.claude_bin)}' Enter")
+
+
+def cmd_tmux_status(args):
+    from dcam import tmux
+    from dcam.orchestrator import list_tasks
+
+    if not tmux.session_exists(args.session):
+        print(f"No tmux session '{args.session}'.")
+        return
+    print(f"Session: {args.session}")
+    print(f"Windows:")
+    for w in tmux.list_windows(args.session):
+        marker = ""
+        if w == "manager":
+            marker = " [manager]"
+        elif w == "review":
+            marker = " [reviewer]"
+        elif w.startswith("dev-"):
+            marker = f" [dev:{w[4:]}]"
+        print(f"  {w}{marker}")
+
+    # Surface beads tasks tagged role:dev
+    try:
+        dev_tasks = list_tasks(status="open", labels=["role:dev"])
+    except Exception:
+        dev_tasks = []
+    if dev_tasks:
+        print("\nOpen dev tasks:")
+        for t in dev_tasks:
+            slug = next((l.split(":", 1)[1] for l in t.labels
+                         if l.startswith("slug:")), "?")
+            print(f"  {t.id}  P{t.priority}  slug:{slug}  {t.title[:60]}")
+
+
+def cmd_tmux_send(args):
+    from dcam import tmux
+    tmux.send_keys(args.session, args.window, args.text,
+                   press_enter=not args.no_enter)
+    print(f"✓ sent {len(args.text)} chars to {args.session}:{args.window}")
+
+
+def cmd_tmux_capture(args):
+    from dcam import tmux
+    out = tmux.capture_pane(args.session, args.window, tail=args.tail)
+    print(out)
+
+
+def cmd_tmux_update(args):
+    from dcam.orchestrator import comment_task, list_tasks
+    # Find the bd task with matching slug label
+    open_tasks = list_tasks(status="open", labels=["role:dev", f"slug:{args.slug}"])
+    if not open_tasks:
+        print(f"No open dev task with slug '{args.slug}' found.", file=sys.stderr)
+        sys.exit(1)
+    task = open_tasks[0]
+    comment_task(task.id, f"[status] {args.message}")
+    print(f"✓ commented on {task.id}: [status] {args.message[:80]}")
+
+
+def _find_dev_task(slug):
+    from dcam.orchestrator import list_tasks
+    tasks = list_tasks(status="open", labels=["role:dev", f"slug:{slug}"])
+    return tasks[0].id if tasks else None
+
+
+def cmd_tmux_ask(args):
+    from dcam import decisions
+    store = get_store(args.namespace, args.search_backend, args.catalog,
+                      getattr(args, "branch", "main"), getattr(args, "root", None))
+    store.init_tables()
+    task_id = _find_dev_task(args.slug)
+    d = decisions.request_decision(
+        store, slug=args.slug, title=args.title, context=args.context,
+        options=args.options, recommended=args.recommend,
+        task_id=task_id, session_id=args.session_id,
+    )
+    print(f"✓ requested DEC-{d.id} (slug={args.slug}, status=open)")
+    if task_id:
+        print(f"  bd comment posted on {task_id}")
+
+
+def cmd_tmux_decide(args):
+    from dcam import decisions
+    store = get_store(args.namespace, args.search_backend, args.catalog,
+                      getattr(args, "branch", "main"), getattr(args, "root", None))
+    store.init_tables()
+    project_path = args.project or os.getcwd()
+    d = decisions.decide(
+        store,
+        decision_id=args.id,
+        supersedes=args.supersedes,
+        chosen=args.choice,
+        rationale=args.rationale,
+        decided_by=args.decided_by,
+        persist_target=args.persist,
+        project_path=project_path if args.persist else None,
+    )
+    print(f"✓ DEC-{d.id} decided ({d.status.value}): chose {d.chosen}")
+    if d.supersedes_id:
+        print(f"  supersedes DEC-{d.supersedes_id}")
+    if args.persist:
+        print(f"  persisted to {args.persist}")
+
+
+def cmd_tmux_decisions_list(args):
+    store = get_store(args.namespace, args.search_backend, args.catalog,
+                      getattr(args, "branch", "main"), getattr(args, "root", None))
+    decisions_ = store.read_decisions(status=args.status)
+    if not decisions_:
+        print("No decisions.")
+        return
+    for d in sorted(decisions_, key=lambda x: x.id or 0):
+        age = (datetime.now() - d.created_at).total_seconds() / 60
+        chosen = f"→ {d.chosen}" if d.chosen else ""
+        print(f"  DEC-{d.id:>3}  {d.status.value:11}  slug:{d.requested_by or '-':<20}  "
+              f"{d.title[:50]}  {chosen}  ({int(age)}m old)")
+
+
+def cmd_tmux_decisions_show(args):
+    from dcam import decisions as decmod
+    store = get_store(args.namespace, args.search_backend, args.catalog,
+                      getattr(args, "branch", "main"), getattr(args, "root", None))
+    chain = store.get_decision_chain(args.id)
+    if not chain:
+        print(f"No decision DEC-{args.id}", file=sys.stderr)
+        sys.exit(1)
+    print(decmod.render_decisions_section(chain))
+
+
+def cmd_tmux_lesson(args):
+    from dcam import decisions
+    store = get_store(args.namespace, args.search_backend, args.catalog,
+                      getattr(args, "branch", "main"), getattr(args, "root", None))
+    store.init_tables()
+    project_path = args.project or os.getcwd()
+    l = decisions.add_lesson(
+        store, content=args.content, category=args.category,
+        source_slug=args.slug, persist_target=args.persist,
+        project_path=project_path if args.persist else None,
+    )
+    print(f"✓ recorded lesson #{l.id} (category={l.category or 'general'})")
+    if args.persist:
+        print(f"  persisted to {args.persist}")
+
+
+def cmd_tmux_persist(args):
+    from dcam import decisions
+    store = get_store(args.namespace, args.search_backend, args.catalog,
+                      getattr(args, "branch", "main"), getattr(args, "root", None))
+    project_path = args.project or os.getcwd()
+    paths = decisions.persist_to_project(store, project_path, target=args.target)
+    if not paths:
+        if args.target == "auto":
+            print("No files with DCAM markers found. Run `dcam tmux persist "
+                  "--target claude` (or agents/both) once to opt CLAUDE.md/"
+                  "AGENTS.md in.")
+        else:
+            print(f"No files written.")
+        return
+    for p in paths:
+        print(f"✓ wrote {p}")
+
+
+def cmd_tmux_msg(args):
+    from dcam import tmux
+    from dcam.orchestrator import comment_task
+    # Live forward via tmux send-keys
+    notice = f"[msg from dev:{args.from_slug}] {args.text}"
+    if args.session:
+        try:
+            tmux.send_keys(args.session, args.to_slug, notice)
+        except Exception as e:
+            print(f"  (tmux send skipped: {e})", file=sys.stderr)
+    # Persistent record on receiver's bd task
+    receiver_task = _find_dev_task(args.to_slug)
+    if receiver_task:
+        comment_task(receiver_task, notice)
+        print(f"✓ msg sent to dev:{args.to_slug} (bd: {receiver_task})")
+    else:
+        print(f"  (no open bd task for dev:{args.to_slug})")
+
+
+def cmd_tmux_dep(args):
+    from dcam.orchestrator import add_dependency
+    blocker_id = _find_dev_task(args.blocker)
+    blocked_id = _find_dev_task(args.blocked)
+    if not (blocker_id and blocked_id):
+        print(f"Need open dev tasks for both slugs (blocker={blocker_id}, "
+              f"blocked={blocked_id})", file=sys.stderr)
+        sys.exit(1)
+    if add_dependency(blocker_id, blocked_id):
+        print(f"✓ {args.blocked} now blocked by {args.blocker} "
+              f"({blocked_id} ← {blocker_id})")
+    else:
+        print("Failed to add dependency", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_tmux_deps(args):
+    from dcam.orchestrator import list_tasks
+    target_id = _find_dev_task(args.slug)
+    if not target_id:
+        print(f"No open dev task for slug '{args.slug}'", file=sys.stderr)
+        sys.exit(1)
+    # bd doesn't expose `dep show` cleanly through our wrapper; surface via list
+    tasks = list_tasks(status="open", labels=["role:dev"])
+    print(f"All open dev tasks (use `bd show {target_id}` for full dep tree):")
+    for t in tasks:
+        slug = next((l.split(":", 1)[1] for l in t.labels if l.startswith("slug:")), "?")
+        marker = " ← target" if t.id == target_id else ""
+        print(f"  {t.id}  slug:{slug:<20}  {t.title[:60]}{marker}")
 
 
 def cmd_task_create(args):
@@ -340,7 +667,7 @@ def cmd_task_ready(args):
 
 def cmd_task_plan(args):
     from dcam.orchestrator import plan_session
-    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"))
+    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"), getattr(args, "root", None))
     tasks = plan_session(store, args.session_id)
     if not tasks:
         print("Failed to plan. Check session ID and kiro-cli availability.")
@@ -352,7 +679,7 @@ def cmd_task_plan(args):
 
 
 def cmd_claude_init(args):
-    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"))
+    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"), getattr(args, "root", None))
     store.init_tables()
     project_path = args.project or os.getcwd()
     hook_path, settings_path = claude_code.install_claude_code_hook(
@@ -367,7 +694,7 @@ def cmd_claude_init(args):
 
 
 def cmd_claude_sync(args):
-    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"))
+    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"), getattr(args, "root", None))
     store.init_tables()
     project_path = args.project or os.getcwd()
     if args.session_file:
@@ -388,12 +715,17 @@ def cmd_claude_list(args):
         print("No Claude Code sessions found.")
         return
     for s in sessions[:args.limit]:
-        print(f"  {s['session_id'][:12]}  {s.get('started_at', 'N/A')[:16]}  "
+        sid = s['session_id'] if args.full_id else s['session_id'][:12]
+        print(f"  {sid}  {s.get('started_at', 'N/A')[:16]}  "
               f"{s['message_count']:>3} msgs  {s['project']}")
 
 
 def cmd_claude_recall(args):
-    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"))
+    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"), getattr(args, "root", None))
+    # Resolve session_id prefix against stored sessions
+    full_session_id = _resolve_session_prefix(store, args.session_id)
+    if full_session_id:
+        args.session_id = full_session_id
     msgs = store.read_messages(args.session_id)
     if not msgs:
         # Try syncing first
@@ -402,6 +734,7 @@ def cmd_claude_recall(args):
         match = next((s for s in sessions if s["session_id"].startswith(args.session_id)), None)
         if match:
             claude_code.sync_session(store, match["path"])
+            args.session_id = match["session_id"]
             msgs = store.read_messages(match["session_id"])
     if not msgs:
         print(f"No messages for session {args.session_id}")
@@ -436,7 +769,7 @@ def cmd_claude_recall(args):
 
 
 def cmd_claude_search(args):
-    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"))
+    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"), getattr(args, "root", None))
     results = store.search_messages(args.query, limit=args.limit)
     if not results:
         print(f"No results for '{args.query}'")
@@ -447,7 +780,7 @@ def cmd_claude_search(args):
 
 
 def cmd_claude_context(args):
-    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"))
+    store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"), getattr(args, "root", None))
     # Sync latest before showing context
     if not args.no_sync:
         project_path = args.project or os.getcwd()
@@ -460,6 +793,95 @@ def cmd_claude_context(args):
         print("No previous session context available.")
 
 
+def cmd_project_init(args):
+    from dcam.project import init_project, discover_root, is_project_root
+    repo = args.repo or os.getcwd()
+    root = init_project(repo, namespace=args.namespace, force=args.force)
+    print(f"✓ DCAM project initialized at {root}")
+    print(f"  Committed:   decisions.json, lessons.json, sessions.json")
+    print(f"  Local-only:  tables/{args.namespace}/  (gitignored)")
+    print(f"  Hook source: hooks/pre-commit  (committed; install per clone)")
+    print()
+    print("Next steps:")
+    print(f"  1. Review {root}/.gitignore and {root}/README.md")
+    print(f"  2. git add {root}/ && git commit -m 'Initialize DCAM memory'")
+    print(f"  3. dcam project install-hook   "
+          f"# enable auto-persist on git commit")
+    print(f"  4. From anywhere in the repo: dcam tmux ask … / decide … / lesson …")
+    # Touch the catalog so empty tables get created with the right shape.
+    store = get_store(args.namespace, args.search_backend, args.catalog,
+                      getattr(args, "branch", "main"), str(root))
+    store.init_tables()
+
+
+def cmd_project_status(args):
+    from dcam.project import discover_root, is_project_root
+    root = discover_root(args.root)
+    project_mode = is_project_root(root)
+    print(f"Storage root: {root}")
+    print(f"Mode:         {'project (committable)' if project_mode else 'global (~/.dcam/)'}")
+    if project_mode:
+        for name in ("decisions.json", "lessons.json", "sessions.json"):
+            f = root / name
+            if f.exists():
+                size = f.stat().st_size
+                # Count records cheaply
+                try:
+                    import json
+                    rows = len(json.loads(f.read_text() or "[]"))
+                except Exception:
+                    rows = "?"
+                print(f"  {name:<20} {rows:>4} rows ({size} bytes)")
+            else:
+                print(f"  {name:<20}  (missing — run `dcam project init`)")
+        tables_dir = root / "tables"
+        if tables_dir.exists():
+            for ns_dir in sorted(tables_dir.iterdir()):
+                if not ns_dir.is_dir():
+                    continue
+                pq_files = list(ns_dir.glob("*.parquet"))
+                total = sum(p.stat().st_size for p in pq_files)
+                print(f"  tables/{ns_dir.name}/  {len(pq_files)} parquet files "
+                      f"({total} bytes)  [local]")
+    else:
+        # Global mode: surface the parquet tables at ~/.dcam/tables/.
+        tables_dir = root / "tables"
+        if tables_dir.exists():
+            for ns_dir in sorted(tables_dir.iterdir()):
+                if ns_dir.is_dir():
+                    pq_files = list(ns_dir.glob("*.parquet"))
+                    print(f"  tables/{ns_dir.name}/  {len(pq_files)} parquet files")
+
+
+def cmd_project_path(args):
+    from dcam.project import discover_root
+    print(discover_root(args.root))
+
+
+def cmd_project_install_hook(args):
+    from dcam.project import install_hook
+    repo = args.repo or os.getcwd()
+    try:
+        target = install_hook(repo, force=args.force)
+    except RuntimeError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    print(f"✓ pre-commit hook installed at {target}")
+    print(f"  → linked to .dcam/hooks/pre-commit")
+    print(f"  Auto-runs `dcam tmux persist --target auto` whenever a")
+    print(f"  committed DCAM JSON file is staged. Skip with --no-verify.")
+
+
+def cmd_project_uninstall_hook(args):
+    from dcam.project import uninstall_hook
+    repo = args.repo or os.getcwd()
+    removed = uninstall_hook(repo)
+    if removed:
+        print(f"✓ removed {removed}")
+    else:
+        print("No DCAM-installed pre-commit hook found (nothing changed).")
+
+
 def main():
     p = argparse.ArgumentParser(prog="dcam", description="DeltaCAT Agent Memory")
     p.add_argument("--namespace", default="dcam")
@@ -469,10 +891,38 @@ def main():
                    help="Storage backend: local, delta, branch (branched delta), or deltacat")
     p.add_argument("--branch", default="main",
                    help="Branch name for branch backend (default: main)")
+    p.add_argument("--root", default=None,
+                   help="DCAM storage root (overrides DCAM_ROOT and the "
+                        ".dcam/ walk-up discovery)")
     sub = p.add_subparsers(dest="command")
 
     sub.add_parser("init")
     sub.add_parser("status")
+
+    # Project (committable, .dcam/) subcommands
+    proj_p = sub.add_parser("project",
+                            help="Project-scoped, committable memory (.dcam/)")
+    psub = proj_p.add_subparsers(dest="project_cmd")
+    pi = psub.add_parser("init", help="Create .dcam/ in the target repo")
+    pi.add_argument("--repo", default=None,
+                    help="Repo root (default: cwd)")
+    pi.add_argument("--force", action="store_true",
+                    help="Overwrite existing README/.gitignore/empty JSON files")
+    psub.add_parser("status",
+                    help="Show the active root and what is stored")
+    psub.add_parser("path",
+                    help="Print the active DCAM storage root")
+    pih = psub.add_parser(
+        "install-hook",
+        help="Symlink .git/hooks/pre-commit → .dcam/hooks/pre-commit "
+             "so committed JSON changes auto-regenerate CLAUDE.md/AGENTS.md")
+    pih.add_argument("--repo", default=None, help="Repo root (default: cwd)")
+    pih.add_argument("--force", action="store_true",
+                     help="Overwrite an existing non-DCAM pre-commit hook")
+    puh = psub.add_parser("uninstall-hook",
+                          help="Remove the DCAM pre-commit symlink "
+                               "(no-op if it isn't ours)")
+    puh.add_argument("--repo", default=None)
 
     chat_p = sub.add_parser("chat")
     csub = chat_p.add_subparsers(dest="chat_cmd")
@@ -515,6 +965,7 @@ def main():
     ccs.add_argument("--title", default=None)
     ccl = ccsub.add_parser("list", help="List Claude Code sessions")
     ccl.add_argument("--project", default=None); ccl.add_argument("--limit", type=int, default=20)
+    ccl.add_argument("--full-id", action="store_true", help="Print full session UUIDs")
     ccr = ccsub.add_parser("recall", help="Recall a Claude Code session (pass -- followed by claude options to launch a session)")
     ccr.add_argument("session_id"); ccr.add_argument("--project", default=None)
     ccr.add_argument("--limit", type=int, default=50)
@@ -530,6 +981,110 @@ def main():
     orch_p = sub.add_parser("orchestrate", help="Start orchestration loop")
     orch_p.add_argument("--interval", type=int, default=10, help="Poll interval in seconds")
 
+    # tmux multi-agent subcommands
+    tmux_p = sub.add_parser("tmux", help="Multi-agent coordination via tmux")
+    txsub = tmux_p.add_subparsers(dest="tmux_cmd")
+
+    tx_start = txsub.add_parser("start", help="Create tmux session with manager window")
+    tx_start.add_argument("session", help="tmux session name")
+    tx_start.add_argument("--project", default=None, help="Project path (default: cwd)")
+    tx_start.add_argument("--launch", action="store_true",
+                          help="Auto-launch the manager agent in the window")
+    tx_start.add_argument("--claude-bin", default="claude",
+                          help="Path/name of the claude binary")
+
+    tx_dev = txsub.add_parser("dev", help="Spawn a dev window")
+    tx_dev.add_argument("session", help="tmux session name")
+    tx_dev.add_argument("slug", help="Short task identifier (slugified)")
+    tx_dev.add_argument("brief", help="One-line task description for the dev")
+    tx_dev.add_argument("--project", default=None)
+    tx_dev.add_argument("--launch", action="store_true",
+                        help="Auto-launch the dev agent in the window")
+    tx_dev.add_argument("--claude-bin", default="claude")
+    tx_dev.add_argument("--priority", "-p", type=int, default=1)
+    tx_dev.add_argument("--no-task", action="store_true",
+                        help="Skip creating a beads task for this dev")
+
+    tx_review = txsub.add_parser("review", help="Spawn the on-demand reviewer window")
+    tx_review.add_argument("session", help="tmux session name")
+    tx_review.add_argument("--project", default=None)
+    tx_review.add_argument("--launch", action="store_true")
+    tx_review.add_argument("--claude-bin", default="claude")
+
+    tx_status = txsub.add_parser("status", help="Show tmux windows + open dev tasks")
+    tx_status.add_argument("session", help="tmux session name")
+
+    tx_send = txsub.add_parser("send", help="Send text to a window's pane")
+    tx_send.add_argument("session"); tx_send.add_argument("window")
+    tx_send.add_argument("text")
+    tx_send.add_argument("--no-enter", action="store_true")
+
+    tx_cap = txsub.add_parser("capture", help="Capture a window's pane buffer")
+    tx_cap.add_argument("session"); tx_cap.add_argument("window")
+    tx_cap.add_argument("--tail", type=int, default=200)
+
+    tx_upd = txsub.add_parser("update", help="Post a milestone status to the dev's beads task")
+    tx_upd.add_argument("slug"); tx_upd.add_argument("message")
+
+    tx_ask = txsub.add_parser("ask", help="Dev requests a manager decision")
+    tx_ask.add_argument("slug")
+    tx_ask.add_argument("title")
+    tx_ask.add_argument("--context", default="")
+    tx_ask.add_argument("--options", default="",
+                        help="Either 'A:summary|B:summary' or JSON list")
+    tx_ask.add_argument("--recommend", default=None, help="Recommended option key")
+    tx_ask.add_argument("--session-id", default=None)
+
+    tx_dec = txsub.add_parser("decide", help="Manager resolves a decision")
+    tx_dec.add_argument("--id", type=int, default=None,
+                        help="Existing open decision to resolve")
+    tx_dec.add_argument("--supersedes", type=int, default=None,
+                        help="Older decision id to supersede with a new revision")
+    tx_dec.add_argument("--choice", required=True)
+    tx_dec.add_argument("--rationale", required=True)
+    tx_dec.add_argument("--decided-by", default="manager")
+    tx_dec.add_argument("--persist", choices=["claude", "agents", "both"],
+                        default=None)
+    tx_dec.add_argument("--project", default=None)
+
+    tx_decs = txsub.add_parser("decisions", help="List/show decisions")
+    decsub = tx_decs.add_subparsers(dest="dec_cmd")
+    dl = decsub.add_parser("list")
+    dl.add_argument("--status", default=None,
+                    choices=["open", "decided", "superseded", "withdrawn"])
+    ds = decsub.add_parser("show")
+    ds.add_argument("id", type=int)
+
+    tx_les = txsub.add_parser("lesson", help="Record a lesson learnt")
+    tx_les.add_argument("content")
+    tx_les.add_argument("--category", default=None,
+                        choices=["design", "testing", "ops", "process", None])
+    tx_les.add_argument("--slug", default=None, help="Source dev slug")
+    tx_les.add_argument("--persist", choices=["claude", "agents", "both"],
+                        default=None)
+    tx_les.add_argument("--project", default=None)
+
+    tx_pst = txsub.add_parser("persist",
+                              help="Render decisions+lessons into CLAUDE.md/AGENTS.md")
+    tx_pst.add_argument("--target",
+                        choices=["claude", "agents", "both", "auto"],
+                        default="claude",
+                        help="auto = only update files that already have "
+                             "DCAM markers (used by the pre-commit hook)")
+    tx_pst.add_argument("--project", default=None)
+
+    tx_msg = txsub.add_parser("msg", help="Dev-to-dev message via tmux + bd")
+    tx_msg.add_argument("from_slug"); tx_msg.add_argument("to_slug")
+    tx_msg.add_argument("text")
+    tx_msg.add_argument("--session", default=None,
+                        help="tmux session for live send-keys (optional)")
+
+    tx_depa = txsub.add_parser("dep", help="Mark <blocked> as blocked by <blocker>")
+    tx_depa.add_argument("blocker"); tx_depa.add_argument("blocked")
+
+    tx_deps = txsub.add_parser("deps", help="Show open dev tasks (with target marked)")
+    tx_deps.add_argument("slug")
+
     # task subcommands
     task_p = sub.add_parser("task", help="Task management via beads")
     tsub = task_p.add_subparsers(dest="task_cmd")
@@ -539,7 +1094,10 @@ def main():
     tsub.add_parser("ready")
     tp = tsub.add_parser("plan"); tp.add_argument("session_id")
 
-    args, remaining = p.parse_known_args()
+    # Allow global flags (--namespace/--search-backend/--catalog/--branch) to
+    # appear after the subcommand by hoisting them to the front before parsing.
+    argv = _hoist_global_flags(sys.argv[1:])
+    args, remaining = p.parse_known_args(argv)
 
     # Pass remaining args to claude recall as claude CLI options
     if args.command == "claude" and getattr(args, "claude_cmd", None) == "recall":
@@ -571,6 +1129,34 @@ def main():
     elif args.command == "branch":
         {"list": cmd_branch_list, "merge": cmd_branch_merge,
          "delete": cmd_branch_delete}.get(args.branch_cmd, lambda _: br_p.print_help())(args)
+    elif args.command == "project":
+        {"init": cmd_project_init, "status": cmd_project_status,
+         "path": cmd_project_path,
+         "install-hook": cmd_project_install_hook,
+         "uninstall-hook": cmd_project_uninstall_hook}.get(
+             getattr(args, "project_cmd", None),
+             lambda _: proj_p.print_help())(args)
+    elif args.command == "tmux":
+        try:
+            tmux_dispatch = {
+                "start": cmd_tmux_start, "dev": cmd_tmux_dev,
+                "review": cmd_tmux_review, "status": cmd_tmux_status,
+                "send": cmd_tmux_send, "capture": cmd_tmux_capture,
+                "update": cmd_tmux_update,
+                "ask": cmd_tmux_ask, "decide": cmd_tmux_decide,
+                "lesson": cmd_tmux_lesson, "persist": cmd_tmux_persist,
+                "msg": cmd_tmux_msg, "dep": cmd_tmux_dep, "deps": cmd_tmux_deps,
+            }
+            if args.tmux_cmd == "decisions":
+                {"list": cmd_tmux_decisions_list, "show": cmd_tmux_decisions_show}.get(
+                    getattr(args, "dec_cmd", None),
+                    lambda _: tx_decs.print_help())(args)
+            else:
+                tmux_dispatch.get(args.tmux_cmd,
+                                  lambda _: tmux_p.print_help())(args)
+        except RuntimeError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
     elif args.command in cmds:
         cmds[args.command](args)
     else:
