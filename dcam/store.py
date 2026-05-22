@@ -11,8 +11,9 @@ from dcam.local_catalog import LocalCatalog
 from dcam.search import SearchBackend, get_backend
 from dcam.models import (
     ChatMessage, ChatSession, ChunkType, CriticalPoint, CriticalPointStatus,
-    Decision, DecisionStatus, FileChunk, Lesson, Memory, MemoryType,
-    MessageRole,
+    Decision, DecisionStatus, FileChunk, Handoff, HandoffStatus, Lesson,
+    Memory, MemoryType, MessageRole, Review, ReviewRequest,
+    ReviewRequestStatus, Spec,
 )
 
 # --- Schemas ---
@@ -80,6 +81,45 @@ CRITICAL_POINT_SCHEMA = pa.schema([
     ("retired_at", pa.string()), ("retired_reason", pa.string()),
 ])
 
+REVIEW_REQUEST_SCHEMA = pa.schema([
+    ("id", pa.int64()), ("slug", pa.string()), ("notes", pa.string()),
+    ("scope_files", pa.string()),
+    ("epic", pa.string()), ("op", pa.string()), ("ticket", pa.string()),
+    ("git_head", pa.string()), ("related_decision_ids", pa.string()),
+    ("status", pa.string()), ("claimed_by", pa.string()),
+    ("session_id", pa.string()), ("persist_target", pa.string()),
+    ("persisted_at", pa.string()), ("created_at", pa.string()),
+    ("claimed_at", pa.string()), ("completed_at", pa.string()),
+])
+
+REVIEW_SCHEMA = pa.schema([
+    ("id", pa.int64()), ("request_id", pa.int64()),
+    ("reviewer", pa.string()), ("summary", pa.string()),
+    ("blocking_findings", pa.int64()), ("advisory_findings", pa.int64()),
+    ("lessons_added", pa.string()), ("critical_added", pa.string()),
+    ("epic", pa.string()), ("op", pa.string()), ("ticket", pa.string()),
+    ("persist_target", pa.string()), ("persisted_at", pa.string()),
+    ("created_at", pa.string()),
+])
+
+HANDOFF_SCHEMA = pa.schema([
+    ("id", pa.int64()), ("from_slug", pa.string()), ("to_slug", pa.string()),
+    ("files", pa.string()), ("notes", pa.string()),
+    ("epic", pa.string()), ("op", pa.string()), ("ticket", pa.string()),
+    ("status", pa.string()), ("ack_notes", pa.string()),
+    ("persist_target", pa.string()), ("persisted_at", pa.string()),
+    ("created_at", pa.string()), ("acknowledged_at", pa.string()),
+])
+
+SPEC_SCHEMA = pa.schema([
+    ("id", pa.int64()), ("path", pa.string()), ("title", pa.string()),
+    ("content_hash", pa.string()),
+    ("epic", pa.string()), ("op", pa.string()),
+    ("last_linked_decision_id", pa.int64()),
+    ("last_synced_at", pa.string()),
+    ("created_at", pa.string()), ("updated_at", pa.string()),
+])
+
 ALL_TABLES = {
     "memories": MEMORY_SCHEMA,
     "chat_messages": MESSAGE_SCHEMA,
@@ -89,6 +129,10 @@ ALL_TABLES = {
     "decisions": DECISION_SCHEMA,
     "lessons": LESSON_SCHEMA,
     "critical_points": CRITICAL_POINT_SCHEMA,
+    "review_requests": REVIEW_REQUEST_SCHEMA,
+    "reviews": REVIEW_SCHEMA,
+    "handoffs": HANDOFF_SCHEMA,
+    "specs": SPEC_SCHEMA,
 }
 
 
@@ -153,7 +197,9 @@ class DeltaStore:
         for table, col in [("memories", "id"), ("chat_messages", "id"),
                            ("compact_chunks", "chunk_id"),
                            ("decisions", "id"), ("lessons", "id"),
-                           ("critical_points", "id")]:
+                           ("critical_points", "id"),
+                           ("review_requests", "id"), ("reviews", "id"),
+                           ("handoffs", "id"), ("specs", "id")]:
             try:
                 t = self._read_table(table)
                 if t and t.num_rows > 0:
@@ -633,3 +679,262 @@ class DeltaStore:
         else:
             all_cp.append(cp)
         self.write_critical_points(all_cp)
+
+    # --- Review Requests ---
+
+    def read_review_requests(self,
+                             status: Optional[str] = None) -> List[ReviewRequest]:
+        t = self._read_table("review_requests")
+        if not t:
+            return []
+        out: List[ReviewRequest] = []
+        for i in range(t.num_rows):
+            r = {c: t.column(c)[i].as_py() for c in t.column_names}
+            req = ReviewRequest(
+                id=r["id"], slug=r.get("slug"),
+                notes=r.get("notes") or "",
+                scope_files=r.get("scope_files") or "",
+                epic=r.get("epic"), op=r.get("op"), ticket=r.get("ticket"),
+                git_head=r.get("git_head"),
+                related_decision_ids=r.get("related_decision_ids") or "",
+                status=ReviewRequestStatus(r.get("status") or "pending"),
+                claimed_by=r.get("claimed_by"),
+                session_id=r.get("session_id"),
+                persist_target=r.get("persist_target"),
+                persisted_at=self._opt_dt(r.get("persisted_at")),
+                created_at=self._opt_dt(r.get("created_at")) or datetime.now(),
+                claimed_at=self._opt_dt(r.get("claimed_at")),
+                completed_at=self._opt_dt(r.get("completed_at")),
+            )
+            if status and req.status.value != status:
+                continue
+            out.append(req)
+            if req.id and req.id >= self._counters.get("review_requests", 0):
+                self._counters["review_requests"] = req.id
+        return out
+
+    def write_review_requests(self, reqs: List[ReviewRequest]):
+        if not reqs:
+            return
+        data = {
+            "id": [r.id for r in reqs],
+            "slug": [r.slug for r in reqs],
+            "notes": [r.notes for r in reqs],
+            "scope_files": [r.scope_files for r in reqs],
+            "epic": [r.epic for r in reqs],
+            "op": [r.op for r in reqs],
+            "ticket": [r.ticket for r in reqs],
+            "git_head": [r.git_head for r in reqs],
+            "related_decision_ids": [r.related_decision_ids for r in reqs],
+            "status": [r.status.value for r in reqs],
+            "claimed_by": [r.claimed_by for r in reqs],
+            "session_id": [r.session_id for r in reqs],
+            "persist_target": [r.persist_target for r in reqs],
+            "persisted_at": [r.persisted_at.isoformat() if r.persisted_at else None for r in reqs],
+            "created_at": [r.created_at.isoformat() for r in reqs],
+            "claimed_at": [r.claimed_at.isoformat() if r.claimed_at else None for r in reqs],
+            "completed_at": [r.completed_at.isoformat() if r.completed_at else None for r in reqs],
+        }
+        self._write_table("review_requests",
+                          pa.Table.from_pydict(data, schema=REVIEW_REQUEST_SCHEMA))
+
+    def append_review_request(self, req: ReviewRequest) -> ReviewRequest:
+        req.id = self._next_id("review_requests")
+        existing = self.read_review_requests()
+        existing.append(req)
+        self.write_review_requests(existing)
+        return req
+
+    def update_review_request(self, req: ReviewRequest):
+        all_r = self.read_review_requests()
+        for i, x in enumerate(all_r):
+            if x.id == req.id:
+                all_r[i] = req
+                break
+        else:
+            all_r.append(req)
+        self.write_review_requests(all_r)
+
+    # --- Reviews ---
+
+    def read_reviews(self) -> List[Review]:
+        t = self._read_table("reviews")
+        if not t:
+            return []
+        out: List[Review] = []
+        for i in range(t.num_rows):
+            r = {c: t.column(c)[i].as_py() for c in t.column_names}
+            rv = Review(
+                id=r["id"], request_id=r.get("request_id") or 0,
+                reviewer=r.get("reviewer") or "reviewer",
+                summary=r.get("summary") or "",
+                blocking_findings=r.get("blocking_findings") or 0,
+                advisory_findings=r.get("advisory_findings") or 0,
+                lessons_added=r.get("lessons_added") or "",
+                critical_added=r.get("critical_added") or "",
+                epic=r.get("epic"), op=r.get("op"), ticket=r.get("ticket"),
+                persist_target=r.get("persist_target"),
+                persisted_at=self._opt_dt(r.get("persisted_at")),
+                created_at=self._opt_dt(r.get("created_at")) or datetime.now(),
+            )
+            out.append(rv)
+            if rv.id and rv.id >= self._counters.get("reviews", 0):
+                self._counters["reviews"] = rv.id
+        return out
+
+    def write_reviews(self, reviews: List[Review]):
+        if not reviews:
+            return
+        data = {
+            "id": [r.id for r in reviews],
+            "request_id": [r.request_id for r in reviews],
+            "reviewer": [r.reviewer for r in reviews],
+            "summary": [r.summary for r in reviews],
+            "blocking_findings": [r.blocking_findings for r in reviews],
+            "advisory_findings": [r.advisory_findings for r in reviews],
+            "lessons_added": [r.lessons_added for r in reviews],
+            "critical_added": [r.critical_added for r in reviews],
+            "epic": [r.epic for r in reviews],
+            "op": [r.op for r in reviews],
+            "ticket": [r.ticket for r in reviews],
+            "persist_target": [r.persist_target for r in reviews],
+            "persisted_at": [r.persisted_at.isoformat() if r.persisted_at else None for r in reviews],
+            "created_at": [r.created_at.isoformat() for r in reviews],
+        }
+        self._write_table("reviews",
+                          pa.Table.from_pydict(data, schema=REVIEW_SCHEMA))
+
+    def append_review(self, rv: Review) -> Review:
+        rv.id = self._next_id("reviews")
+        existing = self.read_reviews()
+        existing.append(rv)
+        self.write_reviews(existing)
+        return rv
+
+    # --- Handoffs ---
+
+    def read_handoffs(self,
+                      status: Optional[str] = None) -> List[Handoff]:
+        t = self._read_table("handoffs")
+        if not t:
+            return []
+        out: List[Handoff] = []
+        for i in range(t.num_rows):
+            r = {c: t.column(c)[i].as_py() for c in t.column_names}
+            h = Handoff(
+                id=r["id"],
+                from_slug=r.get("from_slug") or "",
+                to_slug=r.get("to_slug") or "",
+                files=r.get("files") or "",
+                notes=r.get("notes") or "",
+                epic=r.get("epic"), op=r.get("op"), ticket=r.get("ticket"),
+                status=HandoffStatus(r.get("status") or "pending"),
+                ack_notes=r.get("ack_notes"),
+                persist_target=r.get("persist_target"),
+                persisted_at=self._opt_dt(r.get("persisted_at")),
+                created_at=self._opt_dt(r.get("created_at")) or datetime.now(),
+                acknowledged_at=self._opt_dt(r.get("acknowledged_at")),
+            )
+            if status and h.status.value != status:
+                continue
+            out.append(h)
+            if h.id and h.id >= self._counters.get("handoffs", 0):
+                self._counters["handoffs"] = h.id
+        return out
+
+    def write_handoffs(self, handoffs: List[Handoff]):
+        if not handoffs:
+            return
+        data = {
+            "id": [h.id for h in handoffs],
+            "from_slug": [h.from_slug for h in handoffs],
+            "to_slug": [h.to_slug for h in handoffs],
+            "files": [h.files for h in handoffs],
+            "notes": [h.notes for h in handoffs],
+            "epic": [h.epic for h in handoffs],
+            "op": [h.op for h in handoffs],
+            "ticket": [h.ticket for h in handoffs],
+            "status": [h.status.value for h in handoffs],
+            "ack_notes": [h.ack_notes for h in handoffs],
+            "persist_target": [h.persist_target for h in handoffs],
+            "persisted_at": [h.persisted_at.isoformat() if h.persisted_at else None for h in handoffs],
+            "created_at": [h.created_at.isoformat() for h in handoffs],
+            "acknowledged_at": [h.acknowledged_at.isoformat() if h.acknowledged_at else None for h in handoffs],
+        }
+        self._write_table("handoffs",
+                          pa.Table.from_pydict(data, schema=HANDOFF_SCHEMA))
+
+    def append_handoff(self, h: Handoff) -> Handoff:
+        h.id = self._next_id("handoffs")
+        existing = self.read_handoffs()
+        existing.append(h)
+        self.write_handoffs(existing)
+        return h
+
+    def update_handoff(self, h: Handoff):
+        all_h = self.read_handoffs()
+        for i, x in enumerate(all_h):
+            if x.id == h.id:
+                all_h[i] = h
+                break
+        else:
+            all_h.append(h)
+        self.write_handoffs(all_h)
+
+    # --- Specs ---
+
+    def read_specs(self) -> List[Spec]:
+        t = self._read_table("specs")
+        if not t:
+            return []
+        out: List[Spec] = []
+        for i in range(t.num_rows):
+            r = {c: t.column(c)[i].as_py() for c in t.column_names}
+            s = Spec(
+                id=r["id"], path=r.get("path") or "",
+                title=r.get("title"), content_hash=r.get("content_hash"),
+                epic=r.get("epic"), op=r.get("op"),
+                last_linked_decision_id=r.get("last_linked_decision_id"),
+                last_synced_at=self._opt_dt(r.get("last_synced_at")),
+                created_at=self._opt_dt(r.get("created_at")) or datetime.now(),
+                updated_at=self._opt_dt(r.get("updated_at")) or datetime.now(),
+            )
+            out.append(s)
+            if s.id and s.id >= self._counters.get("specs", 0):
+                self._counters["specs"] = s.id
+        return out
+
+    def write_specs(self, specs: List[Spec]):
+        if not specs:
+            return
+        data = {
+            "id": [s.id for s in specs],
+            "path": [s.path for s in specs],
+            "title": [s.title for s in specs],
+            "content_hash": [s.content_hash for s in specs],
+            "epic": [s.epic for s in specs],
+            "op": [s.op for s in specs],
+            "last_linked_decision_id": [s.last_linked_decision_id for s in specs],
+            "last_synced_at": [s.last_synced_at.isoformat() if s.last_synced_at else None for s in specs],
+            "created_at": [s.created_at.isoformat() for s in specs],
+            "updated_at": [s.updated_at.isoformat() for s in specs],
+        }
+        self._write_table("specs",
+                          pa.Table.from_pydict(data, schema=SPEC_SCHEMA))
+
+    def append_spec(self, s: Spec) -> Spec:
+        s.id = self._next_id("specs")
+        existing = self.read_specs()
+        existing.append(s)
+        self.write_specs(existing)
+        return s
+
+    def update_spec(self, s: Spec):
+        all_s = self.read_specs()
+        for i, x in enumerate(all_s):
+            if x.id == s.id:
+                all_s[i] = s
+                break
+        else:
+            all_s.append(s)
+        self.write_specs(all_s)

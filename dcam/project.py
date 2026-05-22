@@ -58,6 +58,13 @@ are designed to be reviewed in pull requests:
 - `critical_points.json` — forward-looking invariants and guard rails
   ("never run integ tests under admin creds") that the reviewer checks
   on every run.
+- `review_requests.json` — devs' pull-based asks for reviewer feedback.
+- `reviews.json` — completed-review records (audit of who reviewed what
+  and what new lessons / critical points came out of it).
+- `handoffs.json` — structured peer-to-peer handoffs between dev slugs.
+- `specs.json` — registered markdown spec files; tracks content hash and
+  the most recent decision linked, so `dcam tmux spec drift` can flag
+  specs whose linked decisions have changed since last sync.
 - `sessions.json` — one row per Claude Code session, with the structured
   heuristic summary (files touched, commands run, URLs/tickets, errors).
 
@@ -126,7 +133,7 @@ fi
 
 # No-op unless one of the committable JSON files is staged.
 STAGED=$(git diff --cached --name-only --diff-filter=ACM | \\
-         grep -E '^\\.dcam/(decisions|lessons|sessions|critical_points)\\.json$' || true)
+         grep -E '^\\.dcam/(decisions|lessons|sessions|critical_points|review_requests|reviews|handoffs|specs)\\.json$' || true)
 if [[ -z "$STAGED" ]]; then
     exit 0
 fi
@@ -240,7 +247,8 @@ def init_project(repo_path: str, namespace: str = "dcam",
     # `json.loads(path.read_text() or "[]")` either way, but new contributors
     # see something concrete in `git status` after `dcam project init`.
     for name in ("decisions.json", "lessons.json", "sessions.json",
-                 "critical_points.json"):
+                 "critical_points.json", "review_requests.json",
+                 "reviews.json", "handoffs.json", "specs.json"):
         f = root / name
         if force or not f.exists():
             f.write_text("[]\n")

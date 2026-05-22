@@ -35,6 +35,8 @@ LES_START = "<!-- DCAM:LESSONS:START -->"
 LES_END = "<!-- DCAM:LESSONS:END -->"
 CP_START = "<!-- DCAM:CRITICAL:START -->"
 CP_END = "<!-- DCAM:CRITICAL:END -->"
+HO_START = "<!-- DCAM:HANDOFFS:START -->"
+HO_END = "<!-- DCAM:HANDOFFS:END -->"
 
 
 def _scope_label(epic, op) -> str:
@@ -426,10 +428,11 @@ def _replace_section(text: str, start: str, end: str, new_body: str) -> str:
 
 
 def _persist_to_file(path: Path, decisions_md: str, lessons_md: str,
-                     critical_md: str):
+                     critical_md: str, handoffs_md: str):
     text = path.read_text() if path.exists() else ""
     text = _replace_section(text, CP_START, CP_END, critical_md)
     text = _replace_section(text, DEC_START, DEC_END, decisions_md)
+    text = _replace_section(text, HO_START, HO_END, handoffs_md)
     text = _replace_section(text, LES_START, LES_END, lessons_md)
     path.write_text(text)
 
@@ -451,7 +454,8 @@ def discover_persist_targets(project_path: str) -> List[Path]:
         text = p.read_text(errors="replace")
         if ((DEC_START in text and DEC_END in text)
                 or (LES_START in text and LES_END in text)
-                or (CP_START in text and CP_END in text)):
+                or (CP_START in text and CP_END in text)
+                or (HO_START in text and HO_END in text)):
             found.append(p)
     return found
 
@@ -469,9 +473,13 @@ def persist_to_project(store: DeltaStore, project_path: str,
     decisions = store.read_decisions()
     lessons = store.read_lessons()
     critical = store.read_critical_points()
+    handoffs = store.read_handoffs()
     decisions_md = render_decisions_section(decisions)
     lessons_md = render_lessons_section(lessons)
     critical_md = render_critical_section(critical)
+    # Imported lazily to avoid a circular dep at module import time.
+    from dcam.reviews import render_handoffs_section
+    handoffs_md = render_handoffs_section(handoffs)
 
     targets: List[Path] = []
     root = Path(project_path)
@@ -486,7 +494,7 @@ def persist_to_project(store: DeltaStore, project_path: str,
     written: List[Path] = []
     now = datetime.now()
     for p in targets:
-        _persist_to_file(p, decisions_md, lessons_md, critical_md)
+        _persist_to_file(p, decisions_md, lessons_md, critical_md, handoffs_md)
         written.append(p)
 
     # Mark decisions/lessons/critical as persisted
@@ -505,5 +513,10 @@ def persist_to_project(store: DeltaStore, project_path: str,
         cp.persisted_at = now
     if critical:
         store.write_critical_points(critical)
+    for h in handoffs:
+        h.persist_target = target
+        h.persisted_at = now
+    if handoffs:
+        store.write_handoffs(handoffs)
 
     return written

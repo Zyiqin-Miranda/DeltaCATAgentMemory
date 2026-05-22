@@ -16,7 +16,9 @@ AI chat sessions are ephemeral — when you close a chat, all context is lost. Y
 - **Long-term memory** — key facts extracted and recalled with Ebbinghaus decay
 - **Code index** — files summarized into compact chunks, fetched on demand instead of loading full files into context
 - **Decisions and lessons** — first-class records for architectural decisions (with supersession audit trail) and cross-session learnings, rendered as managed sections of `CLAUDE.md`/`AGENTS.md`
-- **Multi-agent over tmux** — manager / dev / reviewer workflow with peer-to-peer messaging, decision asks, and dep tracking ([TMUX.md](TMUX.md))
+- **Multi-agent over tmux** — manager / dev / long-running reviewer workflow with pull-based review requests, structured handoffs, peer-to-peer messaging, decision asks, dep tracking, and a digest view ([TMUX.md](TMUX.md))
+- **Specs as versioned artifacts** — register markdown specs anywhere in the repo; DCAM tracks content hash + linked decisions and surfaces drift / NEEDS-UPDATE markers ([TMUX.md § Specs](TMUX.md#specs-as-versioned-artifacts))
+- **Auto-extract from transcripts** — `dcam claude extract` heuristically surfaces lesson/decision/critical-point candidates from a session, with interactive accept/reject promotion
 - **Project mode** — opt-in `<repo>/.dcam/` directory with JSON-as-primary storage so decisions, lessons, and session summaries are committed and reviewable in PRs alongside source code ([TMUX.md § Project mode](TMUX.md#project-mode-committing-memory-alongside-code))
 - **Pre-commit hook** — auto-regenerates `CLAUDE.md`/`AGENTS.md` managed sections when committed JSON state changes, so docs never drift behind decisions
 - **Task tracking** — sessions linked to Beads issues for persistent task graphs
@@ -339,6 +341,10 @@ dcam CLI / MCP Server
   ├── dcam/orchestrator.py     → Multi-agent task orchestration via beads
   │
   ├── dcam/tmux.py             → tmux session layout + manager/dev/reviewer prompts
+  │
+  ├── dcam/reviews.py          → Pull-based review requests, completed-review records, handoffs
+  │
+  ├── dcam/extract.py          → Heuristic lesson/decision/critical extraction from transcripts
   │
   ├── dcam/decisions.py        → Decision lifecycle + CLAUDE.md/AGENTS.md persistence
   │

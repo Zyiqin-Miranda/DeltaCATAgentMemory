@@ -468,6 +468,193 @@ Output covers:
 Useful for the manager at the top of each day instead of running
 `tmux capture-pane` against every dev window.
 
+## Long-running reviewer agent
+
+The reviewer is a **persistent** Claude Code session in the `review` tmux
+window — not a polling loop. Devs explicitly pull it in by filing review
+requests; the reviewer drains them at its own pace and grows its own
+memory across requests via lessons and critical points.
+
+### Why pull, not push
+
+Polling reviewers either over-trigger (wasting tokens on no-op sweeps)
+or under-trigger (missing real review needs because the heuristic
+didn't fire). Pull-based puts the dev in control: when the dev's work
+is at a reviewable point, *they* file the request. The reviewer agent
+is then notified live through tmux send-keys + a durable
+`review_requests.json` row.
+
+### Setup
+
+```bash
+# Spawn the reviewer window. The launcher embeds a startup-context
+# snippet showing all active critical points + recent review-finding
+# lessons + the current pending queue, so the reviewer agent boots
+# already knowing what prior reviewers learned.
+dcam tmux review <session> --launch
+```
+
+Each new reviewer-session has access to the same growing context — the
+reviewer literally learns over time. Rendered by `bootstrap_context()`
+in `dcam/reviews.py`.
+
+### Dev side: requesting a review
+
+```bash
+dcam tmux request-review auth-flow \
+    --notes "Token refactor ready; please verify revocation path." \
+    --files "src/auth/*.py,tst/auth/*.py" \
+    --decisions "1,3" \
+    --epic native-read --op CreateProvider \
+    --tmux-session myproject
+```
+
+Captures git HEAD, the dev's slug, optional file globs, related
+decisions, scope, and ticket. Files a `review_requests.json` row with
+`status=pending`. If `--tmux-session` is set and the `review` window
+exists, send-keys a one-line notification into the reviewer's pane.
+
+### Reviewer side: draining the queue
+
+```bash
+dcam tmux reviews pending             # what's queued
+dcam tmux reviews show <id>           # full request + the dev's notes
+dcam tmux reviews claim <id>          # mark in-progress
+# ... do the review using the agent's full toolkit ...
+# (file reads, git diff, web/internal search, run scripts, run tests,
+#  consult dcam tmux decisions show, dcam tmux critical list, etc.)
+
+# Record durable learnings BEFORE completing (see REVIEWER_PROMPT in
+# dcam/tmux.py for the workflow detail):
+dcam tmux lesson "Revocation tests should hit central blocklist not local cache." \
+    --category review-finding --epic native-read --op CreateProvider
+dcam tmux critical add "Refresh-token revocation must be synchronous, not eventual." \
+    --rationale "Async path leaves a 1-2s window where revoked tokens still authenticate." \
+    --epic native-read
+
+# Close the request:
+dcam tmux reviews complete <id> \
+    --summary "Logic correct; verify integ test exists for blocklist hit." \
+    --blocking 0 --advisory 1 \
+    --lessons-added 5 --critical-added 2 \
+    --by claude-reviewer \
+    --persist claude
+```
+
+### How the reviewer learns over time
+
+1. The reviewer logs lessons with `--category review-finding`.
+2. Critical points it discovers are persisted into the
+   `## Critical key points` section of `CLAUDE.md` / `AGENTS.md`.
+3. Next time you run `dcam tmux review <session> --launch`, the
+   launcher pulls the active critical points + recent review-finding
+   lessons and appends them to `REVIEWER_PROMPT`.
+4. So the *next* reviewer session boots already knowing what the
+   *previous* reviewer caught.
+
+This is the "agent that grows" loop. Tools the reviewer has (because
+it's a real Claude Code session, not a one-shot caller): web search,
+internal code search via MCP if the project has it wired, writing and
+running scratch Python or shell, reading any file, running tests, git
+diff/log/show, and any other dcam command.
+
+### Audit trail
+
+Every completed request gets a row in `reviews.json`:
+
+```bash
+dcam tmux reviews list
+# RV-1  REQ-1  claude-reviewer  [native-read · CreateProvider]  0b/1a  2026-05-22 12:35
+```
+
+This file is committable and human-reviewable in PRs alongside the
+decisions and lessons it produced.
+
+## Handoffs: structured peer-to-peer transfers
+
+When dev A finishes a slice that dev B will pick up, a `dcam tmux msg`
+is too thin: it's not durable, doesn't carry file lists or scope, and
+doesn't render anywhere reviewable. **Handoffs** fill that role.
+
+```bash
+# Producer:
+dcam tmux handoff create read-prov read-data \
+    --files "tst/parity/recorder.py,tst/parity/normalizer.py" \
+    --notes "Recorder API + normalizer rules; see DEC-1 + DEC-3." \
+    --epic native-read --op ReadDataset \
+    --persist claude
+
+# Receiver acknowledges when they pick it up:
+dcam tmux handoff ack 1 --notes "Picked up; will start with normalizer first." \
+    --persist claude
+```
+
+Render as a managed `## Handoffs` section in `CLAUDE.md`/`AGENTS.md`,
+grouped by status (pending vs acknowledged) so the team can see what
+slices are flowing where.
+
+## Specs as versioned artifacts
+
+A `spec` is any markdown file in the repo that the team treats as a
+controlled design artifact. DCAM tracks the spec's content hash and
+the most recent decision linked to it. Drift detection then surfaces:
+
+- Specs whose on-disk content hash differs from the recorded hash
+  (someone edited the spec since DCAM last saw it).
+- Specs that contain unresolved `<!-- DCAM:NEEDS-UPDATE: DEC-N -->`
+  markers that `dcam tmux spec ref` appended when a related decision
+  changed.
+
+```bash
+# Register a spec (or refresh its hash after intentional edits):
+dcam tmux spec add docs/specs/router.md --epic native-read --op router \
+    --title "Router scaffold spec"
+
+# Link a decision to a spec — appends a NEEDS-UPDATE marker to the
+# spec file so the next reader knows this spec must reconcile DEC-N:
+dcam tmux spec ref <spec-id> <decision-id>
+
+# Surface specs that drifted or have pending markers:
+dcam tmux spec drift
+```
+
+The spec file itself stays where it logically belongs in the repo
+(typically `docs/specs/...`); DCAM only tracks the path + hash, not
+the content.
+
+## Auto-extracting candidates from transcripts
+
+The team will inevitably let a few learnings slip past `dcam tmux
+lesson` / `dcam tmux critical add`. `dcam claude extract` walks a
+session transcript looking for keyword markers and surfaces candidates
+for explicit promotion.
+
+```bash
+# Heuristic scan over a stored Claude Code session:
+dcam claude extract <session-id>
+
+# Output saved to <storage-root>/extract_candidates.json. Then:
+dcam claude extract-review --persist claude
+```
+
+The interactive review prompts you for each candidate: `[a]ccept`,
+`[s]kip`, `[r]eject`. Accepted candidates are promoted to real
+`Lesson`, `CriticalPoint`, or `Decision` records — and (if `--persist`)
+flushed into `CLAUDE.md`/`AGENTS.md` immediately. Rejected ones stay
+in the candidates buffer with `status=rejected` so the same line isn't
+proposed again.
+
+Heuristic markers (no LLM):
+- **Strong** (line starts with): `lesson:`, `decision:`, `critical:`,
+  `rule:`, `invariant:`, `principle:`, `gotcha:`, `watch out:`.
+- **Soft** (phrase anywhere in a sentence): `from now on`, `we'll
+  never`, `we should never`, `always validate`, `the rule is`,
+  `learned that`, `we learned`, `next time`, `burned us`.
+
+Strong matches yield exactly the content after the prefix. Soft
+matches yield the containing sentence. The pass dedupes by
+`(kind, content)` so rerunning extract on the same session is a no-op.
+
 ## Peer-to-peer dev coordination
 
 When dev A's work depends on dev B's, the team should make it explicit
@@ -597,6 +784,20 @@ The parquet rows are the source of truth.
 | `critical list [--status active\|retired]`        | any   | List critical points                                      |
 | `critical retire <id> [--reason --persist]`       | any   | Retire a critical point (kept in JSON for audit)          |
 | `digest [--recent-lessons N]`                     | any   | Standup snapshot: dev status, open decisions, lessons, CPs|
+| `request-review <slug> [--notes --files --decisions --epic --op --ticket --tmux-session]` | dev | File a review request; live-notify the reviewer window  |
+| `reviews pending`                                 | any   | List pending + claimed review requests                    |
+| `reviews show <id>`                               | any   | Show a request and its review (if completed)              |
+| `reviews claim <id> [--by]`                       | reviewer | Claim a request                                          |
+| `reviews complete <id> --summary [--blocking N --advisory M --lessons-added IDs --critical-added IDs --persist]` | reviewer | Close request with a Review record |
+| `reviews list`                                    | any   | Audit trail of completed reviews                          |
+| `reviews withdraw <id> [--reason]`                | dev   | Withdraw a request that's no longer needed                |
+| `handoff create <from> <to> [--files --notes --epic --op --ticket --persist --tmux-session]` | dev | Structured peer handoff                          |
+| `handoff list [--status pending\|acknowledged]`   | any   | List handoffs                                             |
+| `handoff ack <id> [--notes --persist]`            | dev   | Acknowledge a handoff                                     |
+| `spec add <path> [--title --epic --op --repo]`    | any   | Register or refresh a spec by path                        |
+| `spec list`                                       | any   | List registered specs                                     |
+| `spec ref <spec-id> <decision-id> [--repo]`       | any   | Link a decision; appends NEEDS-UPDATE marker to the spec  |
+| `spec drift [--repo]`                             | any   | List drifted specs + unresolved NEEDS-UPDATE markers      |
 | `persist [--target claude\|agents\|both\|auto]`   | any   | Re-render managed markdown sections (auto = only opted-in)|
 | `msg <from> <to> "<text>"`                        | dev   | Dev-to-dev message (tmux + bd)                            |
 | `dep <blocker> <blocked>`                         | any   | Mark `<blocked>` as blocked by `<blocker>`                |
@@ -700,8 +901,10 @@ Things this layer deliberately doesn't do yet:
   args/result).
 - A full `bd` dependency-tree walker; `dcam tmux deps` lists tasks but
   doesn't recurse the graph.
-- A continuous reviewer that polls. Today it's on-demand.
-- A `lesson edit`/`decision withdraw` first-class CLI. Workarounds above.
+- Bidirectional sync to external trackers — `--ticket <url>` records the
+  link, but DCAM doesn't post comments back to the tracker.
+- A `lesson edit` / `decision withdraw` first-class CLI. Workarounds above.
+- Auto-running `dcam claude extract` on SessionEnd; today it's manual.
 
 If you want any of these prioritized, file an issue or add a
 [lesson](#lessons-learnt-cross-session-knowledge) explaining the use

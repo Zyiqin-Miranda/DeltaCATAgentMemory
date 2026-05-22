@@ -139,6 +139,117 @@ class CriticalPoint:
     retired_reason: Optional[str] = None
 
 
+class ReviewRequestStatus(str, Enum):
+    PENDING = "pending"
+    CLAIMED = "claimed"
+    DONE = "done"
+    WITHDRAWN = "withdrawn"
+
+
+@dataclass
+class ReviewRequest:
+    """A dev's pull-based ask for review.
+
+    The reviewer agent runs in a long-lived tmux window and consumes these
+    on `dcam tmux reviews pending`. Each new request triggers a tmux
+    send-keys notification into the reviewer's pane.
+    """
+    id: Optional[int] = None
+    slug: Optional[str] = None              # requesting dev
+    notes: str = ""                         # what to look at
+    scope_files: str = ""                   # comma-sep glob list
+    epic: Optional[str] = None
+    op: Optional[str] = None
+    ticket: Optional[str] = None
+    git_head: Optional[str] = None          # HEAD SHA at request time
+    related_decision_ids: str = ""          # comma-sep DEC ids
+    status: ReviewRequestStatus = ReviewRequestStatus.PENDING
+    claimed_by: Optional[str] = None
+    session_id: Optional[str] = None
+    persist_target: Optional[str] = None
+    persisted_at: Optional[datetime] = None
+    created_at: datetime = field(default_factory=datetime.now)
+    claimed_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+
+
+@dataclass
+class Review:
+    """A reviewer's record of a completed review.
+
+    Always tied to a ReviewRequest (request_id required). Records the
+    summary, what new lessons/critical points came out of it, and any
+    findings flagged blocking. The reviewer's own memory grows: lessons
+    tagged `category=review-finding` are surfaced into the next
+    reviewer-session's startup prompt.
+    """
+    id: Optional[int] = None
+    request_id: int = 0
+    reviewer: str = "reviewer"              # role label or actual identity
+    summary: str = ""
+    blocking_findings: int = 0              # count of must-fix issues
+    advisory_findings: int = 0              # count of suggestions
+    lessons_added: str = ""                 # comma-sep lesson ids
+    critical_added: str = ""                # comma-sep CP ids
+    epic: Optional[str] = None
+    op: Optional[str] = None
+    ticket: Optional[str] = None
+    persist_target: Optional[str] = None
+    persisted_at: Optional[datetime] = None
+    created_at: datetime = field(default_factory=datetime.now)
+
+
+class HandoffStatus(str, Enum):
+    PENDING = "pending"
+    ACKNOWLEDGED = "acknowledged"
+    WITHDRAWN = "withdrawn"
+
+
+@dataclass
+class Handoff:
+    """Structured peer-to-peer handoff between dev slugs.
+
+    More durable than a `dcam tmux msg`: handoffs are the artifact of
+    one engineer finishing a slice that the next engineer needs to pick
+    up. Renders into a managed `## Handoffs` section.
+    """
+    id: Optional[int] = None
+    from_slug: str = ""
+    to_slug: str = ""
+    files: str = ""                         # comma-sep paths/globs
+    notes: str = ""
+    epic: Optional[str] = None
+    op: Optional[str] = None
+    ticket: Optional[str] = None
+    status: HandoffStatus = HandoffStatus.PENDING
+    ack_notes: Optional[str] = None
+    persist_target: Optional[str] = None
+    persisted_at: Optional[datetime] = None
+    created_at: datetime = field(default_factory=datetime.now)
+    acknowledged_at: Optional[datetime] = None
+
+
+@dataclass
+class Spec:
+    """A versioned markdown artifact registered with DCAM.
+
+    Specs live anywhere in the repo, registered by path. DCAM tracks
+    their content hash and the most recent decision id linked to them so
+    `dcam tmux spec drift` can flag specs whose underlying decisions
+    have changed since the last sync.
+    """
+    id: Optional[int] = None
+    path: str = ""                          # relative to repo root
+    title: Optional[str] = None
+    content_hash: Optional[str] = None      # sha256 of file content
+    epic: Optional[str] = None
+    op: Optional[str] = None
+    last_linked_decision_id: Optional[int] = None
+    last_synced_at: Optional[datetime] = None
+    created_at: datetime = field(default_factory=datetime.now)
+    updated_at: datetime = field(default_factory=datetime.now)
+
+
 @dataclass
 class FileChunk:
     chunk_id: int = 0

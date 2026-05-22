@@ -411,11 +411,24 @@ def cmd_tmux_dev(args):
 
 def cmd_tmux_review(args):
     from dcam import tmux
+    from dcam.reviews import bootstrap_context
 
     project_path = args.project or os.getcwd()
-    cmd = tmux.build_reviewer_launch_cmd(args.claude_bin) if args.launch else None
+    # Pull the reviewer's accumulated learning into the startup prompt
+    # so each new reviewer-session knows what prior reviewers learned.
+    store = get_store(args.namespace, args.search_backend, args.catalog,
+                      getattr(args, "branch", "main"), getattr(args, "root", None))
+    extra = bootstrap_context(store) if not args.no_bootstrap else None
+    cmd = (tmux.build_reviewer_launch_cmd(args.claude_bin, extra_context=extra)
+           if args.launch else None)
     target = tmux.spawn_review_window(args.session, project_path, review_cmd=cmd)
     print(f"✓ review window '{target}' ready")
+    if extra and args.launch:
+        crit_count = len([l for l in extra.split("\n") if l.startswith("- CP-")])
+        find_count = len([l for l in extra.split("\n") if l.startswith("- L-")])
+        queue_count = len([l for l in extra.split("\n") if l.startswith("- REQ-")])
+        print(f"  Bootstrapped reviewer with {crit_count} critical points, "
+              f"{find_count} prior findings, {queue_count} pending requests.")
     if not args.launch:
         print(f"  To start the reviewer: tmux send-keys -t {target} "
               f"'{tmux.build_reviewer_launch_cmd(args.claude_bin)}' Enter")
@@ -570,6 +583,339 @@ def cmd_tmux_lesson(args):
     print(f"✓ recorded lesson #{l.id} (category={l.category or 'general'})")
     if args.persist:
         print(f"  persisted to {args.persist}")
+
+
+def cmd_tmux_request_review(args):
+    from dcam import reviews
+    store = get_store(args.namespace, args.search_backend, args.catalog,
+                      getattr(args, "branch", "main"), getattr(args, "root", None))
+    store.init_tables()
+    project_path = args.project or os.getcwd()
+    req = reviews.request_review(
+        store, slug=args.slug, notes=args.notes or "",
+        scope_files=args.files or "",
+        epic=args.epic, op=args.op, ticket=args.ticket,
+        related_decision_ids=args.decisions or "",
+        session_id=args.session_id,
+        project_path=project_path,
+        tmux_session=args.tmux_session,
+    )
+    print(f"✓ requested REQ-{req.id} (slug={args.slug}, status=pending)")
+    if req.git_head:
+        print(f"  HEAD: {req.git_head}")
+    if args.tmux_session:
+        print(f"  notification sent to {args.tmux_session}:review (best-effort)")
+
+
+def cmd_tmux_reviews_pending(args):
+    store = get_store(args.namespace, args.search_backend, args.catalog,
+                      getattr(args, "branch", "main"), getattr(args, "root", None))
+    pending = store.read_review_requests(status="pending")
+    claimed = store.read_review_requests(status="claimed")
+    items = sorted(pending + claimed, key=lambda r: r.id or 0)
+    if not items:
+        print("No pending review requests.")
+        return
+    for r in items:
+        scope_bits = []
+        if r.epic: scope_bits.append(r.epic)
+        if r.op: scope_bits.append(r.op)
+        scope = " · ".join(scope_bits) or "(unscoped)"
+        age = (datetime.now() - r.created_at).total_seconds() / 60
+        marker = "[claimed]" if r.status.value == "claimed" else "[pending]"
+        print(f"  REQ-{r.id:>3}  {marker:<10}  slug:{r.slug or '-':<15}  "
+              f"[{scope:<25}]  ({int(age)}m old)  {r.notes[:60]}")
+
+
+def cmd_tmux_reviews_show(args):
+    store = get_store(args.namespace, args.search_backend, args.catalog,
+                      getattr(args, "branch", "main"), getattr(args, "root", None))
+    reqs = store.read_review_requests()
+    target = next((r for r in reqs if r.id == args.id), None)
+    if not target:
+        print(f"No review request id={args.id}", file=sys.stderr)
+        sys.exit(1)
+    print(f"REQ-{target.id}  status={target.status.value}")
+    print(f"  slug:        {target.slug or '-'}")
+    print(f"  epic/op:     {target.epic or '-'} / {target.op or '-'}")
+    print(f"  ticket:      {target.ticket or '-'}")
+    print(f"  git_head:    {target.git_head or '-'}")
+    print(f"  files:       {target.scope_files or '-'}")
+    print(f"  decisions:   {target.related_decision_ids or '-'}")
+    print(f"  created_at:  {target.created_at.isoformat()}")
+    if target.claimed_by:
+        print(f"  claimed_by:  {target.claimed_by} at {target.claimed_at}")
+    if target.completed_at:
+        print(f"  completed:   {target.completed_at.isoformat()}")
+    if target.notes:
+        print(f"\nNotes:\n  {target.notes}")
+    # If completed, surface the matching Review.
+    if target.status.value == "done":
+        review = next((rv for rv in store.read_reviews()
+                       if rv.request_id == target.id), None)
+        if review:
+            print(f"\nReview RV-{review.id} (by {review.reviewer}):")
+            print(f"  {review.blocking_findings} blocking, "
+                  f"{review.advisory_findings} advisory")
+            if review.lessons_added:
+                print(f"  Lessons added: {review.lessons_added}")
+            if review.critical_added:
+                print(f"  Critical points added: {review.critical_added}")
+            print(f"\n{review.summary}")
+
+
+def cmd_tmux_reviews_claim(args):
+    from dcam import reviews
+    store = get_store(args.namespace, args.search_backend, args.catalog,
+                      getattr(args, "branch", "main"), getattr(args, "root", None))
+    try:
+        req = reviews.claim_review_request(store, args.id, claimed_by=args.by)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    print(f"✓ claimed REQ-{req.id} as {req.claimed_by}")
+
+
+def cmd_tmux_reviews_complete(args):
+    from dcam import reviews
+    store = get_store(args.namespace, args.search_backend, args.catalog,
+                      getattr(args, "branch", "main"), getattr(args, "root", None))
+    project_path = args.project or os.getcwd()
+    lessons_added = []
+    critical_added = []
+    if args.lessons_added:
+        lessons_added = [int(x) for x in args.lessons_added.split(",") if x.strip()]
+    if args.critical_added:
+        critical_added = [int(x) for x in args.critical_added.split(",") if x.strip()]
+    try:
+        rv = reviews.complete_review(
+            store, request_id=args.id, summary=args.summary,
+            blocking_findings=args.blocking, advisory_findings=args.advisory,
+            lessons_added=lessons_added, critical_added=critical_added,
+            reviewer=args.by,
+            project_path=project_path if args.persist else None,
+            persist_target=args.persist,
+        )
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    print(f"✓ completed REQ-{args.id} → RV-{rv.id} "
+          f"({rv.blocking_findings} blocking, {rv.advisory_findings} advisory)")
+    if args.persist:
+        print(f"  persisted to {args.persist}")
+
+
+def cmd_tmux_reviews_list(args):
+    """List all completed reviews (audit trail)."""
+    store = get_store(args.namespace, args.search_backend, args.catalog,
+                      getattr(args, "branch", "main"), getattr(args, "root", None))
+    rs = store.read_reviews()
+    if not rs:
+        print("No reviews recorded yet.")
+        return
+    for rv in sorted(rs, key=lambda r: r.id or 0):
+        scope_bits = []
+        if rv.epic: scope_bits.append(rv.epic)
+        if rv.op: scope_bits.append(rv.op)
+        scope = " · ".join(scope_bits) or "(unscoped)"
+        date = rv.created_at.strftime("%Y-%m-%d %H:%M")
+        print(f"  RV-{rv.id:>3}  REQ-{rv.request_id:>3}  {rv.reviewer:<15}  "
+              f"[{scope:<25}]  {rv.blocking_findings}b/{rv.advisory_findings}a  {date}")
+
+
+def cmd_tmux_reviews_withdraw(args):
+    from dcam import reviews
+    store = get_store(args.namespace, args.search_backend, args.catalog,
+                      getattr(args, "branch", "main"), getattr(args, "root", None))
+    try:
+        req = reviews.withdraw_review_request(store, args.id, reason=args.reason or "")
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    print(f"✓ withdrew REQ-{req.id}")
+
+
+def cmd_tmux_handoff_create(args):
+    from dcam import reviews
+    store = get_store(args.namespace, args.search_backend, args.catalog,
+                      getattr(args, "branch", "main"), getattr(args, "root", None))
+    store.init_tables()
+    project_path = args.project or os.getcwd()
+    h = reviews.create_handoff(
+        store, from_slug=args.from_slug, to_slug=args.to_slug,
+        files=args.files or "", notes=args.notes or "",
+        epic=args.epic, op=args.op, ticket=args.ticket,
+        project_path=project_path if args.persist else None,
+        persist_target=args.persist,
+        tmux_session=args.tmux_session,
+    )
+    print(f"✓ handoff HO-{h.id}: {h.from_slug} → {h.to_slug}")
+    if args.persist:
+        print(f"  persisted to {args.persist}")
+
+
+def cmd_tmux_handoff_list(args):
+    store = get_store(args.namespace, args.search_backend, args.catalog,
+                      getattr(args, "branch", "main"), getattr(args, "root", None))
+    handoffs = store.read_handoffs(status=args.status)
+    if not handoffs:
+        print("No handoffs.")
+        return
+    for h in sorted(handoffs, key=lambda x: x.id or 0):
+        scope_bits = []
+        if h.epic: scope_bits.append(h.epic)
+        if h.op: scope_bits.append(h.op)
+        scope = " · ".join(scope_bits) or "(unscoped)"
+        date = h.created_at.strftime("%Y-%m-%d")
+        print(f"  HO-{h.id:>3}  [{h.status.value:<13}]  "
+              f"{h.from_slug:>10} → {h.to_slug:<10}  [{scope:<20}]  {date}  "
+              f"{h.notes[:50]}")
+
+
+def cmd_tmux_handoff_ack(args):
+    from dcam import reviews
+    store = get_store(args.namespace, args.search_backend, args.catalog,
+                      getattr(args, "branch", "main"), getattr(args, "root", None))
+    try:
+        h = reviews.acknowledge_handoff(store, args.id, ack_notes=args.notes)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    print(f"✓ HO-{h.id} acknowledged")
+    if args.persist:
+        from dcam.decisions import persist_to_project
+        project_path = args.project or os.getcwd()
+        persist_to_project(store, project_path, target=args.persist)
+        print(f"  persisted to {args.persist}")
+
+
+def _hash_file(path):
+    import hashlib
+    h = hashlib.sha256()
+    h.update(path.read_bytes())
+    return h.hexdigest()
+
+
+def cmd_tmux_spec_add(args):
+    from pathlib import Path
+    from dcam.models import Spec
+    store = get_store(args.namespace, args.search_backend, args.catalog,
+                      getattr(args, "branch", "main"), getattr(args, "root", None))
+    store.init_tables()
+
+    target = Path(args.path).resolve()
+    if not target.exists():
+        print(f"Error: {target} does not exist", file=sys.stderr)
+        sys.exit(1)
+    rel = os.path.relpath(target, args.repo or os.getcwd())
+
+    # If a spec with this path already exists, update its hash; else append.
+    existing = next((s for s in store.read_specs() if s.path == rel), None)
+    new_hash = _hash_file(target)
+    if existing:
+        existing.content_hash = new_hash
+        existing.epic = args.epic if args.epic is not None else existing.epic
+        existing.op = args.op if args.op is not None else existing.op
+        existing.title = args.title if args.title is not None else existing.title
+        existing.last_synced_at = datetime.now()
+        existing.updated_at = datetime.now()
+        store.update_spec(existing)
+        s = existing
+    else:
+        s = Spec(path=rel, title=args.title or target.stem,
+                 content_hash=new_hash, epic=args.epic, op=args.op,
+                 last_synced_at=datetime.now())
+        s = store.append_spec(s)
+    print(f"✓ spec SP-{s.id}: {s.path}  hash={s.content_hash[:12]}")
+
+
+def cmd_tmux_spec_list(args):
+    store = get_store(args.namespace, args.search_backend, args.catalog,
+                      getattr(args, "branch", "main"), getattr(args, "root", None))
+    specs = store.read_specs()
+    if not specs:
+        print("No specs registered.")
+        return
+    for s in sorted(specs, key=lambda x: x.id or 0):
+        scope_bits = []
+        if s.epic: scope_bits.append(s.epic)
+        if s.op: scope_bits.append(s.op)
+        scope = " · ".join(scope_bits) or "(unscoped)"
+        link = f" → DEC-{s.last_linked_decision_id}" if s.last_linked_decision_id else ""
+        print(f"  SP-{s.id:>3}  [{scope:<20}]  {s.path}{link}  "
+              f"hash={s.content_hash[:12] if s.content_hash else '?'}")
+
+
+def cmd_tmux_spec_ref(args):
+    """Link a decision to a spec; persist appends a NEEDS-UPDATE marker."""
+    from pathlib import Path
+    store = get_store(args.namespace, args.search_backend, args.catalog,
+                      getattr(args, "branch", "main"), getattr(args, "root", None))
+    specs = store.read_specs()
+    target = next((s for s in specs if s.id == args.spec_id), None)
+    if not target:
+        print(f"No spec id={args.spec_id}", file=sys.stderr)
+        sys.exit(1)
+    target.last_linked_decision_id = args.decision_id
+    target.updated_at = datetime.now()
+    store.update_spec(target)
+
+    # Append a NEEDS-UPDATE marker to the spec file so the next reader sees it.
+    repo_root = args.repo or os.getcwd()
+    spec_path = Path(repo_root) / target.path
+    if spec_path.exists():
+        text = spec_path.read_text()
+        marker = f"\n<!-- DCAM:NEEDS-UPDATE: DEC-{args.decision_id} -->\n"
+        if marker.strip() not in text:
+            if not text.endswith("\n"):
+                text += "\n"
+            spec_path.write_text(text + marker)
+            print(f"✓ SP-{target.id} linked to DEC-{args.decision_id}; "
+                  f"NEEDS-UPDATE marker appended to {target.path}")
+        else:
+            print(f"✓ SP-{target.id} linked to DEC-{args.decision_id} "
+                  f"(marker already present)")
+    else:
+        print(f"⚠ SP-{target.id} linked to DEC-{args.decision_id}, but "
+              f"{target.path} not found in repo; skipped marker")
+
+
+def cmd_tmux_spec_drift(args):
+    """List specs whose on-disk hash differs from the recorded hash, OR
+    specs that contain unresolved NEEDS-UPDATE markers."""
+    from pathlib import Path
+    store = get_store(args.namespace, args.search_backend, args.catalog,
+                      getattr(args, "branch", "main"), getattr(args, "root", None))
+    specs = store.read_specs()
+    repo_root = Path(args.repo or os.getcwd())
+    drifted = []
+    pending_updates = []
+    for s in specs:
+        path = repo_root / s.path
+        if not path.exists():
+            drifted.append((s, "missing"))
+            continue
+        actual_hash = _hash_file(path)
+        if actual_hash != s.content_hash:
+            drifted.append((s, "content-changed"))
+        # NEEDS-UPDATE markers
+        text = path.read_text(errors="replace")
+        for line in text.splitlines():
+            if "DCAM:NEEDS-UPDATE:" in line:
+                pending_updates.append((s, line.strip()))
+
+    if drifted:
+        print("Drift detected (on-disk hash != recorded hash):")
+        for s, reason in drifted:
+            print(f"  SP-{s.id:>3}  {reason:<15}  {s.path}")
+            print(f"       run `dcam tmux spec add {s.path}` to refresh")
+    if pending_updates:
+        print("\nPending NEEDS-UPDATE markers (decisions to reconcile in the spec):")
+        for s, line in pending_updates:
+            print(f"  SP-{s.id:>3}  {s.path}: {line}")
+    if not drifted and not pending_updates:
+        print("No drift; all specs match their recorded hash and have no "
+              "unresolved NEEDS-UPDATE markers.")
 
 
 def cmd_tmux_critical_add(args):
@@ -932,6 +1278,88 @@ def cmd_claude_context(args):
         print("No previous session context available.")
 
 
+def cmd_claude_extract(args):
+    from dcam import extract
+    store = get_store(args.namespace, args.search_backend, args.catalog,
+                      getattr(args, "branch", "main"), getattr(args, "root", None))
+    storage_root = store.storage_root
+
+    # Resolve session prefix the same way recall does
+    full = _resolve_session_prefix(store, args.session_id)
+    if full:
+        args.session_id = full
+
+    cands = extract.extract_candidates_from_session(
+        store, args.session_id, role=args.role)
+    if not cands:
+        print(f"No candidates found in session {args.session_id}.")
+        return
+
+    path = extract.write_candidates(storage_root, cands)
+    print(f"✓ {len(cands)} candidate(s) written to {path}")
+    by_kind = {}
+    for c in cands:
+        by_kind[c["kind"]] = by_kind.get(c["kind"], 0) + 1
+    for k, n in sorted(by_kind.items()):
+        print(f"    {k}: {n}")
+    print()
+    print("Review them with:  dcam claude extract-review")
+
+
+def cmd_claude_extract_review(args):
+    """Interactive accept/edit/reject loop for stored candidates."""
+    from dcam import extract
+    store = get_store(args.namespace, args.search_backend, args.catalog,
+                      getattr(args, "branch", "main"), getattr(args, "root", None))
+    storage_root = store.storage_root
+    candidates = extract.load_candidates(storage_root)
+    pending = [c for c in candidates if c.get("status", "candidate") == "candidate"]
+    if not pending:
+        print("No pending candidates to review.")
+        return
+    print(f"Reviewing {len(pending)} candidate(s). "
+          f"For each: [a]ccept, [s]kip, [r]eject, [q]uit.\n")
+    project_path = args.project or os.getcwd()
+    promoted = 0
+    for cand in pending:
+        print("─" * 60)
+        print(f"  kind:       {cand['kind']}")
+        print(f"  match:      {cand.get('match_type', '?')}")
+        print(f"  source:     {cand.get('source_role')} in "
+              f"{cand.get('source_session_id', '?')[:12]}")
+        print(f"  content:    {cand['content']}")
+        try:
+            choice = input("  > [a/s/r/q] ").strip().lower()
+        except EOFError:
+            choice = "q"
+        if choice == "q":
+            break
+        if choice == "r":
+            cand["status"] = "rejected"
+            continue
+        if choice == "s":
+            continue
+        if choice == "a":
+            epic = input("  epic [optional]: ").strip() or None
+            op = input("  op [optional]:   ").strip() or None
+            try:
+                result = extract.promote_candidate(
+                    store, cand, epic=epic, op=op,
+                    project_path=project_path,
+                    persist_target=args.persist,
+                )
+                cand["status"] = "accepted"
+                cand["promoted_to"] = result
+                promoted += 1
+                print(f"  ✓ promoted to {result['kind']} #{result['id']}")
+            except Exception as e:
+                print(f"  ✗ promote failed: {e}")
+        else:
+            print(f"  (unknown choice; skipping)")
+    extract.save_candidates(storage_root, candidates)
+    print(f"\nPromoted {promoted} candidate(s).")
+
+
 def cmd_project_init(args):
     from dcam.project import init_project, discover_root, is_project_root
     repo = args.repo or os.getcwd()
@@ -1116,6 +1544,20 @@ def main():
     ccctx.add_argument("--messages", type=int, default=20, help="Messages per session")
     ccctx.add_argument("--no-sync", action="store_true", help="Skip sync before context")
 
+    ccex = ccsub.add_parser("extract",
+                            help="Heuristically extract lesson/decision/critical "
+                                 "candidates from a session transcript")
+    ccex.add_argument("session_id")
+    ccex.add_argument("--role", default="any",
+                      choices=["any", "user", "assistant"])
+    ccrv = ccsub.add_parser("extract-review",
+                            help="Interactively accept/edit/reject candidates "
+                                 "and promote accepted ones to real records")
+    ccrv.add_argument("--project", default=None)
+    ccrv.add_argument("--persist", choices=["claude", "agents", "both"],
+                      default=None,
+                      help="Persist promoted records to CLAUDE.md/AGENTS.md")
+
     # orchestrate
     orch_p = sub.add_parser("orchestrate", help="Start orchestration loop")
     orch_p.add_argument("--interval", type=int, default=10, help="Poll interval in seconds")
@@ -1144,11 +1586,15 @@ def main():
     tx_dev.add_argument("--no-task", action="store_true",
                         help="Skip creating a beads task for this dev")
 
-    tx_review = txsub.add_parser("review", help="Spawn the on-demand reviewer window")
+    tx_review = txsub.add_parser("review",
+                                  help="Spawn the long-lived reviewer window")
     tx_review.add_argument("session", help="tmux session name")
     tx_review.add_argument("--project", default=None)
     tx_review.add_argument("--launch", action="store_true")
     tx_review.add_argument("--claude-bin", default="claude")
+    tx_review.add_argument("--no-bootstrap", action="store_true",
+                           help="Skip injecting prior critical points + "
+                                "review-finding lessons into the startup prompt")
 
     tx_status = txsub.add_parser("status", help="Show tmux windows + open dev tasks")
     tx_status.add_argument("session", help="tmux session name")
@@ -1208,8 +1654,10 @@ def main():
 
     tx_les = txsub.add_parser("lesson", help="Record a lesson learnt")
     tx_les.add_argument("content")
+    # Free-form: common values are design/testing/ops/process/review-finding,
+    # but agents may invent new ones. Don't constrain via `choices`.
     tx_les.add_argument("--category", default=None,
-                        choices=["design", "testing", "ops", "process", None])
+                        help="design | testing | ops | process | review-finding | …")
     tx_les.add_argument("--slug", default=None, help="Source dev slug")
     tx_les.add_argument("--epic", default=None)
     tx_les.add_argument("--op", default=None)
@@ -1247,6 +1695,103 @@ def main():
                                    "open decisions, recent lessons, critical points")
     tx_dig.add_argument("--recent-lessons", type=int, default=5,
                         help="How many recent lessons to surface (default: 5)")
+
+    # Review-request workflow
+    tx_rreq = txsub.add_parser("request-review",
+                               help="Dev asks the reviewer for feedback")
+    tx_rreq.add_argument("slug")
+    tx_rreq.add_argument("--notes", default=None,
+                         help="What to look at (one-liner; details in transcript)")
+    tx_rreq.add_argument("--files", default=None,
+                         help="Comma-separated globs the reviewer should focus on")
+    tx_rreq.add_argument("--decisions", default=None,
+                         help="Comma-separated DEC ids relevant to the change")
+    tx_rreq.add_argument("--epic", default=None)
+    tx_rreq.add_argument("--op", default=None)
+    tx_rreq.add_argument("--ticket", default=None)
+    tx_rreq.add_argument("--session-id", default=None)
+    tx_rreq.add_argument("--project", default=None)
+    tx_rreq.add_argument("--tmux-session", default=None,
+                         help="If set, send a live notification into this tmux session's review window")
+
+    tx_rev = txsub.add_parser("reviews", help="Review-request queue")
+    revsub = tx_rev.add_subparsers(dest="rev_cmd")
+    revsub.add_parser("pending", help="List pending + claimed requests")
+    rsh = revsub.add_parser("show", help="Show a single request + its review")
+    rsh.add_argument("id", type=int)
+    rcl = revsub.add_parser("claim", help="Claim a pending request")
+    rcl.add_argument("id", type=int)
+    rcl.add_argument("--by", default="reviewer",
+                     help="Identity recorded as claimed_by")
+    rco = revsub.add_parser("complete", help="Close a request with a review record")
+    rco.add_argument("id", type=int)
+    rco.add_argument("--summary", required=True)
+    rco.add_argument("--blocking", type=int, default=0)
+    rco.add_argument("--advisory", type=int, default=0)
+    rco.add_argument("--lessons-added", default=None,
+                     help="Comma-sep lesson ids recorded during this review")
+    rco.add_argument("--critical-added", default=None,
+                     help="Comma-sep critical-point ids recorded during this review")
+    rco.add_argument("--by", default="reviewer")
+    rco.add_argument("--persist", choices=["claude", "agents", "both"],
+                     default=None)
+    rco.add_argument("--project", default=None)
+    revsub.add_parser("list", help="Audit trail of completed reviews")
+    rwd = revsub.add_parser("withdraw", help="Withdraw a pending request")
+    rwd.add_argument("id", type=int)
+    rwd.add_argument("--reason", default=None)
+
+    # Handoff workflow
+    tx_ho = txsub.add_parser("handoff",
+                             help="Structured peer-to-peer handoff between dev slugs")
+    hosub = tx_ho.add_subparsers(dest="ho_cmd")
+    hoc = hosub.add_parser("create", help="Create a handoff")
+    hoc.add_argument("from_slug", metavar="from")
+    hoc.add_argument("to_slug", metavar="to")
+    hoc.add_argument("--files", default=None,
+                     help="Comma-sep paths/globs the receiver needs")
+    hoc.add_argument("--notes", default=None)
+    hoc.add_argument("--epic", default=None)
+    hoc.add_argument("--op", default=None)
+    hoc.add_argument("--ticket", default=None)
+    hoc.add_argument("--persist", choices=["claude", "agents", "both"],
+                     default=None)
+    hoc.add_argument("--project", default=None)
+    hoc.add_argument("--tmux-session", default=None,
+                     help="If set, send-keys a notification into the receiver's window")
+    hol = hosub.add_parser("list")
+    hol.add_argument("--status", default=None,
+                     choices=["pending", "acknowledged", "withdrawn"])
+    hoa = hosub.add_parser("ack", help="Receiver acknowledges a handoff")
+    hoa.add_argument("id", type=int)
+    hoa.add_argument("--notes", default=None)
+    hoa.add_argument("--persist", choices=["claude", "agents", "both"],
+                     default=None)
+    hoa.add_argument("--project", default=None)
+
+    # Spec workflow
+    tx_sp = txsub.add_parser("spec",
+                             help="Versioned markdown spec artifacts (anywhere in the repo)")
+    spsub = tx_sp.add_subparsers(dest="sp_cmd")
+    spa = spsub.add_parser("add", help="Register or refresh a spec by path")
+    spa.add_argument("path",
+                     help="Path to a markdown file (relative to repo root or absolute)")
+    spa.add_argument("--title", default=None)
+    spa.add_argument("--epic", default=None)
+    spa.add_argument("--op", default=None)
+    spa.add_argument("--repo", default=None,
+                     help="Repo root for path resolution (default: cwd)")
+    spsub.add_parser("list")
+    spr = spsub.add_parser("ref",
+                           help="Link a decision to a spec; appends a "
+                                "NEEDS-UPDATE marker into the spec file")
+    spr.add_argument("spec_id", type=int)
+    spr.add_argument("decision_id", type=int)
+    spr.add_argument("--repo", default=None)
+    spd = spsub.add_parser("drift",
+                           help="List specs whose on-disk hash changed or "
+                                "that contain unresolved NEEDS-UPDATE markers")
+    spd.add_argument("--repo", default=None)
 
     tx_pst = txsub.add_parser("persist",
                               help="Render decisions+lessons into CLAUDE.md/AGENTS.md")
@@ -1309,7 +1854,9 @@ def main():
     elif args.command == "claude":
         {"init": cmd_claude_init, "sync": cmd_claude_sync, "list": cmd_claude_list,
          "recall": cmd_claude_recall, "search": cmd_claude_search,
-         "context": cmd_claude_context}.get(args.claude_cmd, lambda _: cc_p.print_help())(args)
+         "context": cmd_claude_context,
+         "extract": cmd_claude_extract,
+         "extract-review": cmd_claude_extract_review}.get(args.claude_cmd, lambda _: cc_p.print_help())(args)
     elif args.command == "branch":
         {"list": cmd_branch_list, "merge": cmd_branch_merge,
          "delete": cmd_branch_delete}.get(args.branch_cmd, lambda _: br_p.print_help())(args)
@@ -1331,6 +1878,7 @@ def main():
                 "lesson": cmd_tmux_lesson, "persist": cmd_tmux_persist,
                 "msg": cmd_tmux_msg, "dep": cmd_tmux_dep, "deps": cmd_tmux_deps,
                 "digest": cmd_tmux_digest,
+                "request-review": cmd_tmux_request_review,
             }
             if args.tmux_cmd == "decisions":
                 {"list": cmd_tmux_decisions_list, "show": cmd_tmux_decisions_show}.get(
@@ -1342,6 +1890,28 @@ def main():
                  "retire": cmd_tmux_critical_retire}.get(
                     getattr(args, "cp_cmd", None),
                     lambda _: tx_crit.print_help())(args)
+            elif args.tmux_cmd == "reviews":
+                {"pending": cmd_tmux_reviews_pending,
+                 "show": cmd_tmux_reviews_show,
+                 "claim": cmd_tmux_reviews_claim,
+                 "complete": cmd_tmux_reviews_complete,
+                 "list": cmd_tmux_reviews_list,
+                 "withdraw": cmd_tmux_reviews_withdraw}.get(
+                    getattr(args, "rev_cmd", None),
+                    lambda _: tx_rev.print_help())(args)
+            elif args.tmux_cmd == "handoff":
+                {"create": cmd_tmux_handoff_create,
+                 "list": cmd_tmux_handoff_list,
+                 "ack": cmd_tmux_handoff_ack}.get(
+                    getattr(args, "ho_cmd", None),
+                    lambda _: tx_ho.print_help())(args)
+            elif args.tmux_cmd == "spec":
+                {"add": cmd_tmux_spec_add,
+                 "list": cmd_tmux_spec_list,
+                 "ref": cmd_tmux_spec_ref,
+                 "drift": cmd_tmux_spec_drift}.get(
+                    getattr(args, "sp_cmd", None),
+                    lambda _: tx_sp.print_help())(args)
             else:
                 tmux_dispatch.get(args.tmux_cmd,
                                   lambda _: tmux_p.print_help())(args)
