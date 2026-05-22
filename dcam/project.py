@@ -55,6 +55,9 @@ are designed to be reviewed in pull requests:
   decision the agent team has resolved, including superseded revisions.
 - `lessons.json` — durable learnings (design, testing, ops) captured by
   agents during work.
+- `critical_points.json` — forward-looking invariants and guard rails
+  ("never run integ tests under admin creds") that the reviewer checks
+  on every run.
 - `sessions.json` — one row per Claude Code session, with the structured
   heuristic summary (files touched, commands run, URLs/tickets, errors).
 
@@ -123,7 +126,7 @@ fi
 
 # No-op unless one of the committable JSON files is staged.
 STAGED=$(git diff --cached --name-only --diff-filter=ACM | \\
-         grep -E '^\\.dcam/(decisions|lessons|sessions)\\.json$' || true)
+         grep -E '^\\.dcam/(decisions|lessons|sessions|critical_points)\\.json$' || true)
 if [[ -z "$STAGED" ]]; then
     exit 0
 fi
@@ -236,7 +239,8 @@ def init_project(repo_path: str, namespace: str = "dcam",
     # Empty JSON files are safer than missing ones — the catalog can do
     # `json.loads(path.read_text() or "[]")` either way, but new contributors
     # see something concrete in `git status` after `dcam project init`.
-    for name in ("decisions.json", "lessons.json", "sessions.json"):
+    for name in ("decisions.json", "lessons.json", "sessions.json",
+                 "critical_points.json"):
         f = root / name
         if force or not f.exists():
             f.write_text("[]\n")

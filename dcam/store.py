@@ -10,8 +10,9 @@ import pyarrow as pa
 from dcam.local_catalog import LocalCatalog
 from dcam.search import SearchBackend, get_backend
 from dcam.models import (
-    ChatMessage, ChatSession, ChunkType, Decision, DecisionStatus, FileChunk,
-    Lesson, Memory, MemoryType, MessageRole,
+    ChatMessage, ChatSession, ChunkType, CriticalPoint, CriticalPointStatus,
+    Decision, DecisionStatus, FileChunk, Lesson, Memory, MemoryType,
+    MessageRole,
 )
 
 # --- Schemas ---
@@ -55,7 +56,9 @@ DECISION_SCHEMA = pa.schema([
     ("chosen", pa.string()), ("rationale", pa.string()), ("status", pa.string()),
     ("supersedes_id", pa.int64()), ("requested_by", pa.string()),
     ("decided_by", pa.string()), ("task_id", pa.string()),
-    ("session_id", pa.string()), ("persist_target", pa.string()),
+    ("session_id", pa.string()),
+    ("epic", pa.string()), ("op", pa.string()), ("ticket", pa.string()),
+    ("persist_target", pa.string()),
     ("persisted_at", pa.string()), ("created_at", pa.string()),
     ("decided_at", pa.string()), ("updated_at", pa.string()),
 ])
@@ -63,8 +66,18 @@ DECISION_SCHEMA = pa.schema([
 LESSON_SCHEMA = pa.schema([
     ("id", pa.int64()), ("content", pa.string()), ("category", pa.string()),
     ("source_slug", pa.string()), ("session_id", pa.string()),
+    ("epic", pa.string()), ("op", pa.string()), ("ticket", pa.string()),
     ("persist_target", pa.string()), ("persisted_at", pa.string()),
     ("created_at", pa.string()),
+])
+
+CRITICAL_POINT_SCHEMA = pa.schema([
+    ("id", pa.int64()), ("content", pa.string()), ("rationale", pa.string()),
+    ("epic", pa.string()), ("op", pa.string()), ("ticket", pa.string()),
+    ("status", pa.string()), ("source_slug", pa.string()),
+    ("session_id", pa.string()), ("persist_target", pa.string()),
+    ("persisted_at", pa.string()), ("created_at", pa.string()),
+    ("retired_at", pa.string()), ("retired_reason", pa.string()),
 ])
 
 ALL_TABLES = {
@@ -75,6 +88,7 @@ ALL_TABLES = {
     "compact_files": FILE_SCHEMA,
     "decisions": DECISION_SCHEMA,
     "lessons": LESSON_SCHEMA,
+    "critical_points": CRITICAL_POINT_SCHEMA,
 }
 
 
@@ -138,7 +152,8 @@ class DeltaStore:
         """Sync ID counters from existing table data to avoid collisions."""
         for table, col in [("memories", "id"), ("chat_messages", "id"),
                            ("compact_chunks", "chunk_id"),
-                           ("decisions", "id"), ("lessons", "id")]:
+                           ("decisions", "id"), ("lessons", "id"),
+                           ("critical_points", "id")]:
             try:
                 t = self._read_table(table)
                 if t and t.num_rows > 0:
@@ -421,6 +436,7 @@ class DeltaStore:
                 requested_by=r.get("requested_by"),
                 decided_by=r.get("decided_by"),
                 task_id=r.get("task_id"), session_id=r.get("session_id"),
+                epic=r.get("epic"), op=r.get("op"), ticket=r.get("ticket"),
                 persist_target=r.get("persist_target"),
                 persisted_at=self._opt_dt(r.get("persisted_at")),
                 created_at=self._opt_dt(r.get("created_at")) or datetime.now(),
@@ -451,6 +467,9 @@ class DeltaStore:
             "decided_by": [d.decided_by for d in decisions],
             "task_id": [d.task_id for d in decisions],
             "session_id": [d.session_id for d in decisions],
+            "epic": [d.epic for d in decisions],
+            "op": [d.op for d in decisions],
+            "ticket": [d.ticket for d in decisions],
             "persist_target": [d.persist_target for d in decisions],
             "persisted_at": [d.persisted_at.isoformat() if d.persisted_at else None for d in decisions],
             "created_at": [d.created_at.isoformat() for d in decisions],
@@ -501,6 +520,7 @@ class DeltaStore:
                 id=r["id"], content=r.get("content") or "",
                 category=r.get("category"), source_slug=r.get("source_slug"),
                 session_id=r.get("session_id"),
+                epic=r.get("epic"), op=r.get("op"), ticket=r.get("ticket"),
                 persist_target=r.get("persist_target"),
                 persisted_at=self._opt_dt(r.get("persisted_at")),
                 created_at=self._opt_dt(r.get("created_at")) or datetime.now(),
@@ -519,6 +539,9 @@ class DeltaStore:
             "category": [l.category for l in lessons],
             "source_slug": [l.source_slug for l in lessons],
             "session_id": [l.session_id for l in lessons],
+            "epic": [l.epic for l in lessons],
+            "op": [l.op for l in lessons],
+            "ticket": [l.ticket for l in lessons],
             "persist_target": [l.persist_target for l in lessons],
             "persisted_at": [l.persisted_at.isoformat() if l.persisted_at else None for l in lessons],
             "created_at": [l.created_at.isoformat() for l in lessons],
@@ -531,3 +554,82 @@ class DeltaStore:
         existing.append(l)
         self.write_lessons(existing)
         return l
+
+    def update_lesson(self, l: Lesson):
+        all_ls = self.read_lessons()
+        for i, x in enumerate(all_ls):
+            if x.id == l.id:
+                all_ls[i] = l
+                break
+        else:
+            all_ls.append(l)
+        self.write_lessons(all_ls)
+
+    # --- Critical Points ---
+
+    def read_critical_points(self,
+                             status: Optional[str] = None) -> List[CriticalPoint]:
+        t = self._read_table("critical_points")
+        if not t:
+            return []
+        out: List[CriticalPoint] = []
+        for i in range(t.num_rows):
+            r = {c: t.column(c)[i].as_py() for c in t.column_names}
+            cp = CriticalPoint(
+                id=r["id"], content=r.get("content") or "",
+                rationale=r.get("rationale"),
+                epic=r.get("epic"), op=r.get("op"), ticket=r.get("ticket"),
+                status=CriticalPointStatus(r.get("status") or "active"),
+                source_slug=r.get("source_slug"),
+                session_id=r.get("session_id"),
+                persist_target=r.get("persist_target"),
+                persisted_at=self._opt_dt(r.get("persisted_at")),
+                created_at=self._opt_dt(r.get("created_at")) or datetime.now(),
+                retired_at=self._opt_dt(r.get("retired_at")),
+                retired_reason=r.get("retired_reason"),
+            )
+            if status and cp.status.value != status:
+                continue
+            out.append(cp)
+            if cp.id and cp.id >= self._counters.get("critical_points", 0):
+                self._counters["critical_points"] = cp.id
+        return out
+
+    def write_critical_points(self, points: List[CriticalPoint]):
+        if not points:
+            return
+        data = {
+            "id": [p.id for p in points],
+            "content": [p.content for p in points],
+            "rationale": [p.rationale for p in points],
+            "epic": [p.epic for p in points],
+            "op": [p.op for p in points],
+            "ticket": [p.ticket for p in points],
+            "status": [p.status.value for p in points],
+            "source_slug": [p.source_slug for p in points],
+            "session_id": [p.session_id for p in points],
+            "persist_target": [p.persist_target for p in points],
+            "persisted_at": [p.persisted_at.isoformat() if p.persisted_at else None for p in points],
+            "created_at": [p.created_at.isoformat() for p in points],
+            "retired_at": [p.retired_at.isoformat() if p.retired_at else None for p in points],
+            "retired_reason": [p.retired_reason for p in points],
+        }
+        self._write_table("critical_points",
+                          pa.Table.from_pydict(data, schema=CRITICAL_POINT_SCHEMA))
+
+    def append_critical_point(self, cp: CriticalPoint) -> CriticalPoint:
+        cp.id = self._next_id("critical_points")
+        existing = self.read_critical_points()
+        existing.append(cp)
+        self.write_critical_points(existing)
+        return cp
+
+    def update_critical_point(self, cp: CriticalPoint):
+        all_cp = self.read_critical_points()
+        for i, x in enumerate(all_cp):
+            if x.id == cp.id:
+                all_cp[i] = cp
+                break
+        else:
+            all_cp.append(cp)
+        self.write_critical_points(all_cp)

@@ -23,13 +23,14 @@ import pyarrow.parquet as pq
 
 
 # Tables stored as flat JSON files at the root of `.dcam/`.
-JSON_TABLES = {"decisions", "lessons", "chat_sessions"}
+JSON_TABLES = {"decisions", "lessons", "chat_sessions", "critical_points"}
 
 # Map our DCAM table names to JSON file names.
 JSON_FILENAMES = {
     "decisions": "decisions.json",
     "lessons": "lessons.json",
     "chat_sessions": "sessions.json",
+    "critical_points": "critical_points.json",
 }
 
 

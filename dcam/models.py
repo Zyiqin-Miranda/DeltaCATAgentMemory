@@ -85,6 +85,9 @@ class Decision:
     decided_by: Optional[str] = None    # "manager" / role label
     task_id: Optional[str] = None       # bd task id
     session_id: Optional[str] = None
+    epic: Optional[str] = None          # epic slug, e.g. "native-read"
+    op: Optional[str] = None            # operation, e.g. "CreateProvider"
+    ticket: Optional[str] = None        # external ticket URL
     persist_target: Optional[str] = None  # "claude" | "agents" | "both"
     persisted_at: Optional[datetime] = None
     created_at: datetime = field(default_factory=datetime.now)
@@ -99,9 +102,41 @@ class Lesson:
     category: Optional[str] = None      # "design" | "testing" | "ops" | None
     source_slug: Optional[str] = None
     session_id: Optional[str] = None
+    epic: Optional[str] = None
+    op: Optional[str] = None
+    ticket: Optional[str] = None
     persist_target: Optional[str] = None
     persisted_at: Optional[datetime] = None
     created_at: datetime = field(default_factory=datetime.now)
+
+
+class CriticalPointStatus(str, Enum):
+    ACTIVE = "active"
+    RETIRED = "retired"
+
+
+@dataclass
+class CriticalPoint:
+    """A forward-looking invariant or guard rail.
+
+    Distinct from a Lesson: lessons are reactive ("we learned X");
+    critical points are prescriptive ("never run X under admin creds").
+    The reviewer agent reads them every run and flags violations.
+    """
+    id: Optional[int] = None
+    content: str = ""
+    rationale: Optional[str] = None
+    epic: Optional[str] = None          # scope: epic-wide
+    op: Optional[str] = None            # scope: per-op (most specific)
+    ticket: Optional[str] = None
+    status: CriticalPointStatus = CriticalPointStatus.ACTIVE
+    source_slug: Optional[str] = None
+    session_id: Optional[str] = None
+    persist_target: Optional[str] = None
+    persisted_at: Optional[datetime] = None
+    created_at: datetime = field(default_factory=datetime.now)
+    retired_at: Optional[datetime] = None
+    retired_reason: Optional[str] = None
 
 
 @dataclass

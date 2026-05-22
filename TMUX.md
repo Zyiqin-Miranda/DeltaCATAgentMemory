@@ -384,7 +384,89 @@ dcam tmux decide --supersedes 7 --choice cookie \
 
 Now `dcam tmux decisions list` shows both rows: DEC-7 marked
 `superseded`, DEC-9 marked `decided` with `Supersedes. [DEC-7]` in its
-rendered markdown. The audit trail is permanent.
+rendered markdown. The audit trail is permanent. Scope (epic / op /
+ticket) is automatically carried forward to the new revision unless you
+override it on the new `decide` call.
+
+### Scope: epic, op, and ticket links
+
+Decisions, lessons, and critical points all accept three optional scope
+fields:
+
+| Flag        | Purpose                                                | Example                       |
+|-------------|--------------------------------------------------------|-------------------------------|
+| `--epic`    | Epic-level grouping (free-form slug)                    | `--epic native-read`          |
+| `--op`      | Per-operation grouping (free-form name)                 | `--op CreateProvider`         |
+| `--ticket`  | External tracker URL — any tracker works (kept generic) | `--ticket https://…`          |
+
+Why this matters: a project with 10 epics and 60+ subtasks can't
+review a flat list. Scope groups everything in `CLAUDE.md` /
+`AGENTS.md` under headings like `### native-read · CreateProvider`
+instead of one giant pile. The `digest` command and the reviewer's
+critical-point lookups also use these fields.
+
+Example end-to-end:
+
+```bash
+dcam tmux ask read-prov "Recorder API shape" \
+    --context "Native Read Provider needs a recorder for parity tests; what API?" \
+    --options "callback:per-call hook|table:write to a parquet table" \
+    --recommend table \
+    --epic native-read --op CreateProvider \
+    --ticket https://example.com/tickets/B784B446
+```
+
+Tickets render as a generic `[↗ ticket](url)` in the markdown — no
+internal-tool name leaks into committed docs.
+
+## Critical key points: forward-looking invariants
+
+Lessons are reactive (_we learned X_). **Critical points** are
+prescriptive — invariants the team commits to upholding from now on.
+The reviewer agent reads them on every run and flags violations.
+
+```bash
+dcam tmux critical add "Never run integ tests under admin creds; always Test/ReadOnly." \
+    --rationale "We had prod data corruption when admin creds leaked into integ runner." \
+    --epic native-read --persist claude
+
+dcam tmux critical add "DDB Local lies about GSI consistency; integ-verify before shipping." \
+    --rationale "Mock passes, prod fails — lost a week to this once." \
+    --persist claude
+```
+
+When a critical point no longer applies (e.g. an SDK fix), retire it
+rather than deleting:
+
+```bash
+dcam tmux critical retire 2 --reason "DDB Local matches prod GSI semantics in 2026.04 SDK." \
+    --persist claude
+```
+
+Retired points stay in `critical_points.json` for audit but are dropped
+from the rendered `## Critical key points` section so the reviewer's
+focus is on what's actively enforced.
+
+The reviewer prompt is wired to read this section every run; see
+`REVIEWER_PROMPT` in `dcam/tmux.py`.
+
+## Daily digest: standup-style snapshot
+
+`dcam tmux digest` aggregates everything an agent or human needs for a
+quick sync:
+
+```bash
+dcam tmux digest
+```
+
+Output covers:
+- Active dev tasks with their latest `[status]` comment.
+- Open decisions, grouped by `epic · op` scope.
+- Recent lessons (defaults to 5; tunable via `--recent-lessons N`).
+- Active critical points, counted by scope.
+
+Useful for the manager at the top of each day instead of running
+`tmux capture-pane` against every dev window.
 
 ## Peer-to-peer dev coordination
 
@@ -416,11 +498,13 @@ dcam tmux lesson "Always validate input at system boundaries before trusting dow
     --category design --persist claude
 
 dcam tmux lesson "Run integration tests against a real DB; mocked tests passed but the prod migration failed." \
-    --category testing --persist claude
+    --category testing --epic native-read --op ReadDataset --persist claude
 ```
 
 Categories: `design`, `testing`, `ops`, `process`, or none. Lessons are
-grouped by category in the rendered markdown.
+grouped first by `epic · op` scope (when set) and then by category in the
+rendered markdown. Add `--ticket <url>` to link a lesson back to its
+originating tracker item.
 
 ## How decisions and lessons land in CLAUDE.md / AGENTS.md
 
@@ -503,12 +587,16 @@ The parquet rows are the source of truth.
 | `send <session> <window> "<text>"`                | mgr   | tmux send-keys to a window's pane                         |
 | `capture <session> <window> [--tail N]`           | mgr   | Capture a window's pane buffer                            |
 | `update <slug> "<msg>"`                           | dev   | Post a `[status]` comment on the dev's bd task            |
-| `ask <slug> "<title>" --context --options [--recommend]` | dev   | Request a manager decision                          |
-| `decide --id N --choice K --rationale "..." [--persist claude]`  | mgr   | Resolve an open decision                          |
-| `decide --supersedes N --choice K --rationale "..." [--persist]` | mgr   | Revise a prior decision                           |
+| `ask <slug> "<title>" --context --options [--recommend --epic --op --ticket]` | dev   | Request a manager decision                          |
+| `decide --id N --choice K --rationale "..." [--epic --op --ticket --persist]`  | mgr   | Resolve an open decision                          |
+| `decide --supersedes N --choice K --rationale "..." [--persist]` | mgr   | Revise a prior decision (scope/ticket inherit unless overridden) |
 | `decisions list [--status open\|decided\|superseded\|withdrawn]` | any   | Browse decisions                                  |
 | `decisions show <id>`                             | any   | Show decision + full chain history                        |
-| `lesson "<text>" [--category --persist]`          | any   | Record a cross-session lesson                             |
+| `lesson "<text>" [--category --epic --op --ticket --persist]` | any   | Record a cross-session lesson                             |
+| `critical add "<text>" [--rationale --epic --op --ticket --persist]` | any | Record a forward-looking invariant                  |
+| `critical list [--status active\|retired]`        | any   | List critical points                                      |
+| `critical retire <id> [--reason --persist]`       | any   | Retire a critical point (kept in JSON for audit)          |
+| `digest [--recent-lessons N]`                     | any   | Standup snapshot: dev status, open decisions, lessons, CPs|
 | `persist [--target claude\|agents\|both\|auto]`   | any   | Re-render managed markdown sections (auto = only opted-in)|
 | `msg <from> <to> "<text>"`                        | dev   | Dev-to-dev message (tmux + bd)                            |
 | `dep <blocker> <blocked>`                         | any   | Mark `<blocked>` as blocked by `<blocker>`                |

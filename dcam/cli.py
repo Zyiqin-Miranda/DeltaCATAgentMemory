@@ -494,8 +494,13 @@ def cmd_tmux_ask(args):
         store, slug=args.slug, title=args.title, context=args.context,
         options=args.options, recommended=args.recommend,
         task_id=task_id, session_id=args.session_id,
+        epic=args.epic, op=args.op, ticket=args.ticket,
     )
-    print(f"✓ requested DEC-{d.id} (slug={args.slug}, status=open)")
+    scope = []
+    if d.epic: scope.append(f"epic={d.epic}")
+    if d.op: scope.append(f"op={d.op}")
+    scope_str = f", {', '.join(scope)}" if scope else ""
+    print(f"✓ requested DEC-{d.id} (slug={args.slug}, status=open{scope_str})")
     if task_id:
         print(f"  bd comment posted on {task_id}")
 
@@ -513,6 +518,7 @@ def cmd_tmux_decide(args):
         chosen=args.choice,
         rationale=args.rationale,
         decided_by=args.decided_by,
+        epic=args.epic, op=args.op, ticket=args.ticket,
         persist_target=args.persist,
         project_path=project_path if args.persist else None,
     )
@@ -556,12 +562,145 @@ def cmd_tmux_lesson(args):
     project_path = args.project or os.getcwd()
     l = decisions.add_lesson(
         store, content=args.content, category=args.category,
-        source_slug=args.slug, persist_target=args.persist,
+        source_slug=args.slug,
+        epic=args.epic, op=args.op, ticket=args.ticket,
+        persist_target=args.persist,
         project_path=project_path if args.persist else None,
     )
     print(f"✓ recorded lesson #{l.id} (category={l.category or 'general'})")
     if args.persist:
         print(f"  persisted to {args.persist}")
+
+
+def cmd_tmux_critical_add(args):
+    from dcam import decisions
+    store = get_store(args.namespace, args.search_backend, args.catalog,
+                      getattr(args, "branch", "main"), getattr(args, "root", None))
+    store.init_tables()
+    project_path = args.project or os.getcwd()
+    cp = decisions.add_critical_point(
+        store, content=args.content, rationale=args.rationale,
+        epic=args.epic, op=args.op, ticket=args.ticket,
+        source_slug=args.slug,
+        persist_target=args.persist,
+        project_path=project_path if args.persist else None,
+    )
+    print(f"✓ recorded critical point CP-{cp.id}")
+    if args.persist:
+        print(f"  persisted to {args.persist}")
+
+
+def cmd_tmux_critical_list(args):
+    store = get_store(args.namespace, args.search_backend, args.catalog,
+                      getattr(args, "branch", "main"), getattr(args, "root", None))
+    points = store.read_critical_points(status=args.status)
+    if not points:
+        print("No critical points.")
+        return
+    for p in sorted(points, key=lambda x: x.id or 0):
+        scope = []
+        if p.epic: scope.append(f"epic={p.epic}")
+        if p.op: scope.append(f"op={p.op}")
+        scope_str = " ".join(scope) or "(unscoped)"
+        marker = "" if p.status.value == "active" else f" [{p.status.value}]"
+        print(f"  CP-{p.id:>3}{marker}  {scope_str:<35}  {p.content[:80]}")
+
+
+def cmd_tmux_critical_retire(args):
+    from dcam import decisions
+    store = get_store(args.namespace, args.search_backend, args.catalog,
+                      getattr(args, "branch", "main"), getattr(args, "root", None))
+    try:
+        cp = decisions.retire_critical_point(store, args.id, reason=args.reason or "")
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    print(f"✓ CP-{cp.id} retired")
+    if args.persist:
+        project_path = args.project or os.getcwd()
+        decisions.persist_to_project(store, project_path, target=args.persist)
+        print(f"  persisted to {args.persist}")
+
+
+def cmd_tmux_digest(args):
+    """Aggregate per-dev status, open decisions, recent lessons, and critical
+    points into a single 'standup' view."""
+    from dcam import tmux as tmux_mod
+    from dcam.orchestrator import list_tasks, _run_bd
+    store = get_store(args.namespace, args.search_backend, args.catalog,
+                      getattr(args, "branch", "main"), getattr(args, "root", None))
+
+    print("DCAM digest")
+    print("=" * 60)
+
+    # Per-dev status: pull each dev task + its most recent [status] comment.
+    dev_tasks = []
+    try:
+        dev_tasks = list_tasks(status="open", labels=["role:dev"])
+    except Exception:
+        pass
+    if dev_tasks:
+        print("\nActive dev tasks:")
+        for t in sorted(dev_tasks, key=lambda x: x.id):
+            slug = next((l.split(":", 1)[1] for l in t.labels
+                         if l.startswith("slug:")), "?")
+            # Best-effort fetch of latest [status] comment
+            latest_status = ""
+            try:
+                show = _run_bd(["show", t.id, "--json"])
+                if isinstance(show, dict):
+                    comments = show.get("comments", []) or []
+                    for c in reversed(comments):
+                        body = (c.get("body") or "").strip()
+                        if body.startswith("[status]"):
+                            latest_status = body[len("[status]"):].strip()[:80]
+                            break
+            except Exception:
+                pass
+            tail = f"  → {latest_status}" if latest_status else ""
+            print(f"  {t.id}  slug:{slug:<20}  {t.title[:50]}{tail}")
+    else:
+        print("\nActive dev tasks: (none)")
+
+    # Open decisions, grouped by scope
+    open_decisions = store.read_decisions(status="open")
+    print(f"\nOpen decisions: {len(open_decisions)}")
+    if open_decisions:
+        from dcam.decisions import _scope_label
+        from collections import defaultdict
+        grouped = defaultdict(list)
+        for d in open_decisions:
+            grouped[_scope_label(d.epic, d.op)].append(d)
+        for scope in sorted(grouped):
+            print(f"  {scope}:")
+            for d in grouped[scope]:
+                age_min = (datetime.now() - d.created_at).total_seconds() / 60
+                print(f"    DEC-{d.id:>3}  slug:{d.requested_by or '-':<15}  "
+                      f"{d.title[:55]}  ({int(age_min)}m old)")
+
+    # Recent lessons (last N)
+    lessons = store.read_lessons()
+    if lessons:
+        recent = sorted(lessons, key=lambda l: l.created_at, reverse=True)[:args.recent_lessons]
+        print(f"\nRecent lessons ({len(recent)} of {len(lessons)} total):")
+        for l in recent:
+            scope = []
+            if l.epic: scope.append(l.epic)
+            if l.op: scope.append(l.op)
+            scope_str = " · ".join(scope) if scope else "(unscoped)"
+            print(f"  L-{l.id:>3}  [{scope_str}]  {l.content[:80]}")
+
+    # Critical points by scope
+    crits = store.read_critical_points(status="active")
+    if crits:
+        from collections import defaultdict
+        from dcam.decisions import _scope_label
+        grouped = defaultdict(int)
+        for p in crits:
+            grouped[_scope_label(p.epic, p.op)] += 1
+        print(f"\nActive critical points: {len(crits)}")
+        for scope, n in sorted(grouped.items()):
+            print(f"  {scope}: {n}")
 
 
 def cmd_tmux_persist(args):
@@ -1034,6 +1173,12 @@ def main():
                         help="Either 'A:summary|B:summary' or JSON list")
     tx_ask.add_argument("--recommend", default=None, help="Recommended option key")
     tx_ask.add_argument("--session-id", default=None)
+    tx_ask.add_argument("--epic", default=None,
+                        help="Epic scope, e.g. 'native-read'")
+    tx_ask.add_argument("--op", default=None,
+                        help="Per-op scope, e.g. 'CreateProvider'")
+    tx_ask.add_argument("--ticket", default=None,
+                        help="External ticket URL (any tracker)")
 
     tx_dec = txsub.add_parser("decide", help="Manager resolves a decision")
     tx_dec.add_argument("--id", type=int, default=None,
@@ -1043,6 +1188,12 @@ def main():
     tx_dec.add_argument("--choice", required=True)
     tx_dec.add_argument("--rationale", required=True)
     tx_dec.add_argument("--decided-by", default="manager")
+    tx_dec.add_argument("--epic", default=None,
+                        help="Override / set epic scope")
+    tx_dec.add_argument("--op", default=None,
+                        help="Override / set per-op scope")
+    tx_dec.add_argument("--ticket", default=None,
+                        help="Override / set ticket URL")
     tx_dec.add_argument("--persist", choices=["claude", "agents", "both"],
                         default=None)
     tx_dec.add_argument("--project", default=None)
@@ -1060,9 +1211,42 @@ def main():
     tx_les.add_argument("--category", default=None,
                         choices=["design", "testing", "ops", "process", None])
     tx_les.add_argument("--slug", default=None, help="Source dev slug")
+    tx_les.add_argument("--epic", default=None)
+    tx_les.add_argument("--op", default=None)
+    tx_les.add_argument("--ticket", default=None)
     tx_les.add_argument("--persist", choices=["claude", "agents", "both"],
                         default=None)
     tx_les.add_argument("--project", default=None)
+
+    tx_crit = txsub.add_parser("critical",
+                               help="Forward-looking invariants the reviewer enforces")
+    cpsub = tx_crit.add_subparsers(dest="cp_cmd")
+    cpa = cpsub.add_parser("add", help="Record a critical point")
+    cpa.add_argument("content")
+    cpa.add_argument("--rationale", default=None,
+                     help="Why this point matters")
+    cpa.add_argument("--epic", default=None)
+    cpa.add_argument("--op", default=None)
+    cpa.add_argument("--ticket", default=None)
+    cpa.add_argument("--slug", default=None, help="Source dev slug")
+    cpa.add_argument("--persist", choices=["claude", "agents", "both"],
+                     default=None)
+    cpa.add_argument("--project", default=None)
+    cpl = cpsub.add_parser("list", help="List critical points")
+    cpl.add_argument("--status", default=None,
+                     choices=["active", "retired"])
+    cpr = cpsub.add_parser("retire", help="Retire a critical point")
+    cpr.add_argument("id", type=int)
+    cpr.add_argument("--reason", default=None)
+    cpr.add_argument("--persist", choices=["claude", "agents", "both"],
+                     default=None)
+    cpr.add_argument("--project", default=None)
+
+    tx_dig = txsub.add_parser("digest",
+                              help="Standup-style aggregator: per-dev status, "
+                                   "open decisions, recent lessons, critical points")
+    tx_dig.add_argument("--recent-lessons", type=int, default=5,
+                        help="How many recent lessons to surface (default: 5)")
 
     tx_pst = txsub.add_parser("persist",
                               help="Render decisions+lessons into CLAUDE.md/AGENTS.md")
@@ -1146,11 +1330,18 @@ def main():
                 "ask": cmd_tmux_ask, "decide": cmd_tmux_decide,
                 "lesson": cmd_tmux_lesson, "persist": cmd_tmux_persist,
                 "msg": cmd_tmux_msg, "dep": cmd_tmux_dep, "deps": cmd_tmux_deps,
+                "digest": cmd_tmux_digest,
             }
             if args.tmux_cmd == "decisions":
                 {"list": cmd_tmux_decisions_list, "show": cmd_tmux_decisions_show}.get(
                     getattr(args, "dec_cmd", None),
                     lambda _: tx_decs.print_help())(args)
+            elif args.tmux_cmd == "critical":
+                {"add": cmd_tmux_critical_add,
+                 "list": cmd_tmux_critical_list,
+                 "retire": cmd_tmux_critical_retire}.get(
+                    getattr(args, "cp_cmd", None),
+                    lambda _: tx_crit.print_help())(args)
             else:
                 tmux_dispatch.get(args.tmux_cmd,
                                   lambda _: tmux_p.print_help())(args)
