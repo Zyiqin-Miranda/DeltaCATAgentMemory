@@ -1,6 +1,6 @@
 # DeltaCATAgentMemory (dcam)
 
-Persistent agent memory that survives across chat sessions. One CLI integrating **Kiro** + **DeltaCAT** + **Beads**.
+Persistent agent memory that survives across chat sessions. Works with **Claude Code** and **Kiro**, backed by **DeltaCAT** and **Beads**.
 
 ## Problem
 
@@ -9,14 +9,18 @@ AI chat sessions are ephemeral — when you close a chat, all context is lost. Y
 ## Solution
 
 `dcam` persists everything locally:
+- **Claude Code integration** — auto-syncs every Claude Code session to a queryable store via a `SessionEnd` hook; loads structured per-session summaries into the next session via `dcam claude context`
+- **Kiro integration** — pre-tool hook + AGENTS.md instructions so Kiro agents use compaction instead of reading whole files
 - **Chat history** — every message stored and searchable (BM25 ranked) across sessions
 - **Project memory** — named, cross-session facts recalled by name from any conversation
 - **Long-term memory** — key facts extracted and recalled with Ebbinghaus decay
 - **Code index** — files summarized into compact chunks, fetched on demand instead of loading full files into context
+- **Decisions and lessons** — first-class records for architectural decisions (with supersession audit trail) and cross-session learnings, rendered as managed sections of `CLAUDE.md`/`AGENTS.md`
+- **Multi-agent over tmux** — manager / dev / reviewer workflow with peer-to-peer messaging, decision asks, and dep tracking ([TMUX.md](TMUX.md))
+- **Project mode** — opt-in `<repo>/.dcam/` directory with JSON-as-primary storage so decisions, lessons, and session summaries are committed and reviewable in PRs alongside source code ([TMUX.md § Project mode](TMUX.md#project-mode-committing-memory-alongside-code))
+- **Pre-commit hook** — auto-regenerates `CLAUDE.md`/`AGENTS.md` managed sections when committed JSON state changes, so docs never drift behind decisions
 - **Task tracking** — sessions linked to Beads issues for persistent task graphs
-- **MCP server** — 15 native tools for AI assistants via Model Context Protocol
-- **Multi-agent orchestration** — task decomposition and dispatch via beads dependency graph; full manager / dev / reviewer workflow over tmux documented in [TMUX.md](TMUX.md)
-- **Project mode** — opt-in `<repo>/.dcam/` directory with JSON-as-primary storage so decisions, lessons, and session summaries are committed and reviewable in PRs alongside source code (see [TMUX.md § Project mode](TMUX.md#project-mode-committing-memory-alongside-code))
+- **MCP server** — 15 native tools usable from any MCP-compatible client (Claude Code, Kiro, etc.)
 - **Delta storage** — partitioned, append-only deltas with compaction and time-travel
 
 ## Install
@@ -36,14 +40,45 @@ pip install -e '.[deltacat]'
 
 - Python ≥ 3.9
 - [pyarrow](https://arrow.apache.org/docs/python/) ≥ 14.0
+- Optional, but at least one of:
+  - [Claude Code](https://docs.claude.com/en/docs/claude-code) — sessions auto-sync via the installed `SessionEnd` hook
+  - [Kiro](https://github.com/Zyiqin-Miranda/Kiro) — pre-tool hook + AGENTS.md integration
 - Optional: [deltacat](https://github.com/ray-project/deltacat) for ACID-compliant storage
 - Optional: [beads](https://github.com/steveyegge/beads) (`bd` CLI) for task tracking
-- Optional: [Kiro](https://github.com/Zyiqin-Miranda/Kiro) for hook integration
+- Optional: `tmux` ≥ 3.0 for the multi-agent workflow
 
 ## Quick Start
 
+Pick the path that matches your agent host.
+
+### Claude Code path
+
 ```bash
-# 1. Initialize everything (tables + kiro hooks + beads check)
+# 1. Install the SessionEnd hook for this project (one-time per repo).
+cd /path/to/your-project
+dcam claude init
+
+# 2. Use Claude Code normally. Every session auto-syncs to dcam at end.
+#    No manual chat-start/chat-end needed.
+
+# 3. Start your next Claude Code session. It auto-loads structured
+#    summaries of recent sessions via the CLAUDE.md instruction:
+#       dcam claude context
+
+# 4. Search or replay any prior session.
+dcam claude list
+dcam claude search "auth timeout"
+dcam claude recall <session-id>            # Replay a session
+dcam claude recall <session-id> -- --resume # Launch a NEW session pre-loaded with that context
+```
+
+For multi-agent (manager / dev / reviewer over tmux) and project-mode
+(committable team memory), see **[TMUX.md](TMUX.md)**.
+
+### Kiro path
+
+```bash
+# 1. Initialize everything (tables + Kiro pre-tool hook + beads check)
 dcam init
 
 # 2. Store project-level facts that persist across all sessions
@@ -74,10 +109,35 @@ dcam chat start --title "Continue work" --from SESSION_ID
 ### Setup & Status
 
 ```bash
-dcam init                    # Create tables, install hooks, check beads
+dcam init                    # Create tables, install Kiro hooks, check beads
+dcam claude init             # Install Claude Code SessionEnd hook for this project
+dcam project init            # Create committable .dcam/ for team-shared memory
 dcam status                  # Show sessions, memories, indexed files, beads status
+dcam project status          # Show active root, mode, and what is stored
 dcam serve                   # Start MCP server (for native tool integration)
 ```
+
+### Claude Code Integration
+
+`dcam claude` reads Claude Code's JSONL transcripts at
+`~/.claude/projects/.../<id>.jsonl`, syncs them to the dcam store, and
+surfaces summaries on demand.
+
+```bash
+dcam claude init             # Install SessionEnd hook + initial sync
+dcam claude sync             # Manually sync recent Claude Code sessions
+dcam claude list             # List synced sessions (newest first)
+dcam claude list --full-id   # Show full UUIDs (default truncates to 12 chars)
+dcam claude recall ID        # Print messages from session (prefix matching works)
+dcam claude recall ID -- --resume  # Launch a NEW Claude Code session pre-loaded with that context
+dcam claude search "query"   # BM25 search across all synced Claude Code sessions
+dcam claude context          # Print structured summaries of recent sessions
+dcam claude context --sessions 5 --messages 0  # Just summaries, no message dump
+```
+
+Per-session structured summary includes: first/last user prompt, files
+touched (`Read`/`Edit`/`Write`), commands run (`Bash`), URLs and tickets
+referenced (CR-/SIM-/V-), and errors observed in tool output.
 
 ### Project Memory (cross-session)
 
@@ -148,6 +208,9 @@ dcam orchestrate --interval 5                   # Poll every 5 seconds
 ```bash
 # Start the MCP server (stdio transport)
 dcam serve
+
+# Register with Claude Code (one-time setup)
+claude mcp add dcam dcam serve
 
 # Register with kiro-cli (one-time setup)
 kiro-cli mcp add --name dcam --scope global --command dcam --args serve
@@ -260,10 +323,12 @@ Supported languages: Python, Go, TypeScript, JavaScript, Java, Rust, Ruby, YAML,
 ```
 dcam CLI / MCP Server
   │
-  ├── dcam/store.py            → Pluggable storage (local, delta, or deltacat)
+  ├── dcam/store.py            → Pluggable storage (local, delta, deltacat, project-JSON)
   │     ├── memories                (semantic, episodic, procedural, short_term, project)
   │     ├── chat_messages           (partitioned by session_id in delta mode)
-  │     ├── chat_sessions           (session metadata + beads links)
+  │     ├── chat_sessions           (session metadata + structured summaries)
+  │     ├── decisions               (open / decided / superseded / withdrawn, with chain)
+  │     ├── lessons                 (cross-session learnings by category)
   │     ├── compact_chunks          (indexed code chunks with summaries)
   │     └── compact_files           (file-level summaries)
   │
@@ -272,6 +337,16 @@ dcam CLI / MCP Server
   ├── dcam/mcp_server.py       → MCP server (15 native tools)
   │
   ├── dcam/orchestrator.py     → Multi-agent task orchestration via beads
+  │
+  ├── dcam/tmux.py             → tmux session layout + manager/dev/reviewer prompts
+  │
+  ├── dcam/decisions.py        → Decision lifecycle + CLAUDE.md/AGENTS.md persistence
+  │
+  ├── dcam/project.py          → Project-mode root discovery + pre-commit hook
+  │
+  ├── dcam/claude_code.py      → Claude Code JSONL parser + sync + summary heuristics
+  │
+  ├── dcam/json_catalog.py     → JSON-as-primary catalog (committable tables)
   │
   ├── dcam/bridge.py           → Beads (bd CLI) integration
   │
@@ -293,6 +368,38 @@ dcam CLI / MCP Server
   │
   └── dcam/deltacat_catalog.py → DeltaCAT storage backend (optional)
 ```
+
+## Integration with Claude Code
+
+After `dcam claude init`, three things land in your project:
+
+1. A `SessionEnd` hook in `.claude/settings.local.json` that runs
+   `dcam claude sync` automatically at the end of every Claude Code
+   session. No manual chat-start/end needed.
+2. A `CLAUDE.md` instruction telling Claude Code to call
+   `dcam claude context` at the start of each session, so prior work is
+   loaded as structured summaries (files touched, commands run,
+   URLs/tickets, errors).
+3. A shell hook script at `.claude/hooks/dcam-session-sync.sh`.
+
+The hook reads Claude Code's JSONL transcripts at
+`~/.claude/projects/.../<session-uuid>.jsonl`, deduplicates messages by
+UUID, follows conversation branches (so retries/edits don't double-count),
+and writes everything to dcam's tables.
+
+To wire dcam in as MCP tools instead of shell commands, register the MCP
+server with Claude Code:
+
+```bash
+claude mcp add dcam dcam serve
+```
+
+The agent then calls `dcam_recall_memory`, `dcam_lookup`, `dcam_fetch`,
+etc. as native tools.
+
+For multi-agent workflows (manager / dev / reviewer over tmux) and
+project-mode (committable team memory with auto-persist on commit), see
+**[TMUX.md](TMUX.md)**.
 
 ## Integration with Kiro
 
@@ -319,19 +426,37 @@ If `bd` is not available, dcam works in standalone mode.
 
 ## Multi-Agent Orchestration
 
+Two complementary modes ship in dcam:
+
+**1. Beads-driven task queue** — `dcam orchestrate` polls `bd ready` for
+unblocked tasks and dispatches them to kiro-cli agents:
+
 ```bash
-# Create tasks with dependencies
 dcam task create "Step 1: Analyze" -p 0
 dcam task create "Step 2: Implement" -p 1    # blocked until Step 1 closes
-
-# Or auto-decompose from a session goal
-dcam task plan SESSION_ID
-
-# Start the orchestration loop
-dcam orchestrate
+dcam task plan SESSION_ID                    # Auto-decompose via kiro-cli
+dcam orchestrate                             # Start the loop
 ```
 
-The orchestrator polls `bd ready` for unblocked tasks, dispatches them to kiro-cli agents with session context + project memory, logs results, and closes tasks on completion.
+**2. Interactive tmux team** — `dcam tmux` lays out a manager / dev /
+reviewer session of Claude Code (or any agent CLI), with first-class
+support for decisions, lessons, peer messaging, and dep tracking:
+
+```bash
+dcam tmux start <session> --launch
+dcam tmux dev <session> <slug> "<brief>" --launch
+dcam tmux ask <slug> "<title>" --options "A:...|B:..."
+dcam tmux decide --id N --choice A --rationale "..." --persist claude
+dcam tmux review <session> --launch
+```
+
+Decisions, lessons, and per-session structured summaries can be
+committed alongside source code via project mode (`dcam project init`).
+A pre-commit hook keeps `CLAUDE.md`/`AGENTS.md` in sync with the JSON
+state automatically.
+
+See **[TMUX.md](TMUX.md)** for the full workflow, role prompts, and
+end-to-end walkthrough.
 
 ## Running Tests
 
@@ -359,9 +484,52 @@ dcam --search-backend substring  # Exact substring matching
 dcam --catalog local            # Flat parquet files (default)
 dcam --catalog delta            # Partitioned + versioned deltas
 dcam --catalog deltacat         # DeltaCAT ACID storage
+dcam --root PATH                # Override storage root (also via DCAM_ROOT env);
+                                # in project mode, auto-discovered by walking
+                                # up from cwd looking for .dcam/
+```
+
+Global flags work either before or after the subcommand:
+
+```bash
+dcam --namespace foo claude context
+dcam claude context --namespace foo   # equivalent
 ```
 
 ## Example Workflow
+
+### With Claude Code (recommended for new projects)
+
+```bash
+# Day 0: Wire dcam into the project (once).
+cd /path/to/your-project
+dcam claude init
+dcam memory add "Uses Python 3.11, FastAPI backend" --name tech-stack
+dcam memory add "Deploy with: make deploy-prod" --name deploy-cmd
+
+# Day 1: Just open Claude Code and work. Sessions auto-sync at end.
+claude
+# ... feature work happens; SessionEnd hook syncs everything to dcam ...
+
+# Day 2: Open Claude Code again. CLAUDE.md instruction auto-loads context.
+claude
+# (Inside the session: structured summaries of recent work appear via
+# `dcam claude context`. Search prior work with `dcam claude search`.)
+
+# Anytime: review what was done across sessions.
+dcam claude list
+dcam claude search "Stripe webhook"
+dcam claude recall <session-id>
+
+# When you're ready for parallelized agent work, spin up the team:
+dcam project init                           # Make memory committable
+dcam project install-hook                   # Auto-persist on commits
+dcam tmux start payment --launch
+dcam tmux dev payment api "Add /v2/sessions handler" --launch
+# (See TMUX.md for the full multi-agent workflow.)
+```
+
+### With Kiro
 
 ```bash
 # Day 0: Set up project memory (once)
