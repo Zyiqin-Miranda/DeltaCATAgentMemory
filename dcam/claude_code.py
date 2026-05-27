@@ -22,13 +22,19 @@ HISTORY_FILE = CLAUDE_DIR / "history.jsonl"
 
 
 def find_project_dir(project_path: str) -> Optional[Path]:
-    """Find the Claude Code project directory for a given workspace path."""
+    """Find the Claude Code project directory for a given workspace path.
+
+    Returns None on a fresh host where ``~/.claude/projects/`` does not
+    yet exist (no Claude Code session has been run from this account).
+    """
     encoded = project_path.replace("/", "-")
     if encoded.startswith("-"):
         pass
     project_dir = PROJECTS_DIR / encoded
     if project_dir.exists():
         return project_dir
+    if not PROJECTS_DIR.exists():
+        return None
     for d in PROJECTS_DIR.iterdir():
         if d.is_dir() and project_path.rstrip("/").split("/")[-1] in d.name:
             return d
