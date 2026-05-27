@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 from dcam.models import (CriticalPoint, CriticalPointStatus, Decision,
-                         DecisionStatus, Lesson)
+                         DecisionStatus, Lesson, Spec)
 from dcam.store import DeltaStore
 
 # --- Section markers --------------------------------------------------------
@@ -37,6 +37,8 @@ CP_START = "<!-- DCAM:CRITICAL:START -->"
 CP_END = "<!-- DCAM:CRITICAL:END -->"
 HO_START = "<!-- DCAM:HANDOFFS:START -->"
 HO_END = "<!-- DCAM:HANDOFFS:END -->"
+SP_START = "<!-- DCAM:SPECS:START -->"
+SP_END = "<!-- DCAM:SPECS:END -->"
 
 
 def _scope_label(epic, op) -> str:
@@ -378,6 +380,54 @@ def render_lessons_section(lessons: List[Lesson]) -> str:
     return "\n".join(lines)
 
 
+def render_specs_section(specs: List[Spec], project_path: Optional[str] = None) -> str:
+    """Render registered specs grouped by scope.
+
+    Inline drift state per spec when ``project_path`` is given:
+    ``(current)`` if the on-disk hash matches the recorded one,
+    ``(drift)`` if it differs, ``(missing)`` if the file is gone.
+    """
+    if not specs:
+        return "## Specs\n\n_No specs registered yet._\n"
+    specs = sorted(specs, key=lambda s: s.id or 0)
+    grouped = _group_by_scope(specs)
+    lines = [
+        "## Specs",
+        "",
+        "_Versioned markdown artifacts. `dcam tmux spec drift` lists specs "
+        "whose on-disk hash changed or whose linked decisions were updated._",
+        "",
+    ]
+    scope_order = sorted(grouped.keys(),
+                         key=lambda s: (s != "(unscoped)", s))
+    for scope in scope_order:
+        lines.append(f"### {scope}")
+        lines.append("")
+        for s in grouped[scope]:
+            title = s.title or Path(s.path).stem
+            short_hash = (s.content_hash or "?")[:12]
+            state = ""
+            if project_path:
+                full_path = Path(project_path) / s.path
+                if not full_path.exists():
+                    state = "missing"
+                else:
+                    try:
+                        import hashlib
+                        h = hashlib.sha256(full_path.read_bytes()).hexdigest()
+                    except OSError:
+                        h = None
+                    state = "current" if h == s.content_hash else "drift"
+            link = (f", linked to DEC-{s.last_linked_decision_id}"
+                    if s.last_linked_decision_id else "")
+            state_str = f", {state}" if state else ""
+            line = (f"- **SP-{s.id}.** [`{s.path}`]({s.path}) — "
+                    f"{title} (hash {short_hash}{state_str}{link})")
+            lines.append(line)
+        lines.append("")
+    return "\n".join(lines)
+
+
 def render_critical_section(points: List[CriticalPoint]) -> str:
     """Render active critical points grouped by scope.
 
@@ -428,10 +478,11 @@ def _replace_section(text: str, start: str, end: str, new_body: str) -> str:
 
 
 def _persist_to_file(path: Path, decisions_md: str, lessons_md: str,
-                     critical_md: str, handoffs_md: str):
+                     critical_md: str, handoffs_md: str, specs_md: str):
     text = path.read_text() if path.exists() else ""
     text = _replace_section(text, CP_START, CP_END, critical_md)
     text = _replace_section(text, DEC_START, DEC_END, decisions_md)
+    text = _replace_section(text, SP_START, SP_END, specs_md)
     text = _replace_section(text, HO_START, HO_END, handoffs_md)
     text = _replace_section(text, LES_START, LES_END, lessons_md)
     path.write_text(text)
@@ -455,7 +506,8 @@ def discover_persist_targets(project_path: str) -> List[Path]:
         if ((DEC_START in text and DEC_END in text)
                 or (LES_START in text and LES_END in text)
                 or (CP_START in text and CP_END in text)
-                or (HO_START in text and HO_END in text)):
+                or (HO_START in text and HO_END in text)
+                or (SP_START in text and SP_END in text)):
             found.append(p)
     return found
 
@@ -474,9 +526,11 @@ def persist_to_project(store: DeltaStore, project_path: str,
     lessons = store.read_lessons()
     critical = store.read_critical_points()
     handoffs = store.read_handoffs()
+    specs = store.read_specs()
     decisions_md = render_decisions_section(decisions)
     lessons_md = render_lessons_section(lessons)
     critical_md = render_critical_section(critical)
+    specs_md = render_specs_section(specs, project_path=project_path)
     # Imported lazily to avoid a circular dep at module import time.
     from dcam.reviews import render_handoffs_section
     handoffs_md = render_handoffs_section(handoffs)
@@ -494,7 +548,8 @@ def persist_to_project(store: DeltaStore, project_path: str,
     written: List[Path] = []
     now = datetime.now()
     for p in targets:
-        _persist_to_file(p, decisions_md, lessons_md, critical_md, handoffs_md)
+        _persist_to_file(p, decisions_md, lessons_md, critical_md,
+                         handoffs_md, specs_md)
         written.append(p)
 
     # Mark decisions/lessons/critical as persisted
@@ -518,5 +573,8 @@ def persist_to_project(store: DeltaStore, project_path: str,
         h.persisted_at = now
     if handoffs:
         store.write_handoffs(handoffs)
+    # Specs don't carry a persist_target column today; they're rendered
+    # idempotently from the registered set, with on-disk drift state
+    # computed at render time. Nothing to mark on the rows.
 
     return written
