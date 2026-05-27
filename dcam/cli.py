@@ -1363,7 +1363,11 @@ def cmd_claude_extract_review(args):
 def cmd_project_init(args):
     from dcam.project import init_project, discover_root, is_project_root
     repo = args.repo or os.getcwd()
-    root = init_project(repo, namespace=args.namespace, force=args.force)
+    try:
+        root = init_project(repo, namespace=args.namespace, force=args.force)
+    except RuntimeError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
     print(f"✓ DCAM project initialized at {root}")
     print(f"  Committed:   decisions.json, lessons.json, sessions.json")
     print(f"  Local-only:  tables/{args.namespace}/  (gitignored)")
