@@ -386,26 +386,83 @@ def cmd_tmux_start(args):
 def cmd_tmux_dev(args):
     from dcam import tmux
     from dcam.bridge import bd_available, bd_database_initialized
-    from dcam.orchestrator import create_task
+    from dcam.orchestrator import create_task, list_tasks
 
     project_path = args.project or os.getcwd()
     slug = tmux.slugify(args.slug)
     brief = args.brief
 
-    # Create a beads task so queue mode + spawn mode share one source of truth
-    task = None
+    # --- Idempotency: reuse existing task + window for this slug -----------
+    # Pre-2026-05-27 behavior was unconditionally additive: re-running
+    # `dcam tmux dev <slug>` produced a second bd task and a second tmux
+    # window, leaving `dcam tmux update <slug>` to pick one arbitrarily.
+    # Now we look up by `role:dev,slug:<slug>` and reuse what's there.
+
+    existing_task = None
     if not args.no_task:
+        try:
+            matches = list_tasks(status="open",
+                                 labels=["role:dev", f"slug:{slug}"])
+        except Exception:
+            matches = []
+        if len(matches) > 1 and not args.force:
+            ids = ", ".join(t.id for t in matches)
+            print(
+                f"Error: multiple open dev tasks already exist for "
+                f"slug:{slug} ({ids}).\n"
+                f"  This is corrupted state. Close all but one, or pass "
+                f"--force to add yet another.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if matches and not args.force:
+            existing_task = matches[0]
+
+    window_name = f"dev-{slug}"
+    target = f"{args.session}:{window_name}"
+
+    # Window may already exist if the user previously ran `dcam tmux dev`
+    # for this slug. Detect and reuse.
+    existing_window = (tmux._tmux_available()
+                       and tmux.session_exists(args.session)
+                       and window_name in tmux.list_windows(args.session))
+
+    # Create / reuse the bd task
+    task = existing_task
+    if not args.no_task and not existing_task:
         task = create_task(
             f"[dev:{slug}] {brief[:60]}",
             priority=args.priority,
             labels=[f"role:dev", f"slug:{slug}"],
         )
 
-    cmd = tmux.build_dev_launch_cmd(slug, brief, args.claude_bin) if args.launch else None
-    target = tmux.spawn_dev_window(args.session, slug, project_path, dev_cmd=cmd)
-    print(f"✓ dev window '{target}' ready")
+    # Create / reuse the tmux window. spawn_dev_window is already idempotent
+    # on the window name itself, but with --launch it would re-send the
+    # claude command into an already-running pane. Refuse that case unless
+    # --force.
+    cmd = (tmux.build_dev_launch_cmd(slug, brief, args.claude_bin)
+           if args.launch else None)
+    if existing_window and args.launch and not args.force:
+        # Don't re-send the claude command into an existing pane.
+        cmd = None
+        target = tmux.spawn_dev_window(args.session, slug, project_path,
+                                       dev_cmd=None)
+        print(f"✓ reusing dev window '{target}'")
+        print(f"  ⚠ window already running; skipped --launch. Pass --force "
+              f"to send the launch command anyway.")
+    else:
+        target = tmux.spawn_dev_window(args.session, slug, project_path,
+                                       dev_cmd=cmd)
+        if existing_window:
+            print(f"✓ reusing dev window '{target}'")
+        else:
+            print(f"✓ dev window '{target}' ready")
+
     if task:
-        print(f"  Task: {task.id} (label slug:{slug})")
+        if existing_task:
+            print(f"  Task: {task.id} (existing, label slug:{slug})")
+        else:
+            print(f"  Task: {task.id} (label slug:{slug})")
     elif not args.no_task:
         # bd was supposed to create a task but didn't. Be loud about why so
         # the user doesn't hit "No open dev task" later from `tmux update`.
@@ -420,7 +477,8 @@ def cmd_tmux_dev(args):
         else:
             print(f"  ⚠ Failed to create beads task for slug:{slug}. "
                   f"Check `bd doctor`.")
-    if not args.launch:
+
+    if not args.launch and not existing_window:
         print(f"  To start the dev agent: tmux send-keys -t {target} "
               f"'{tmux.build_dev_launch_cmd(slug, brief, args.claude_bin)}' Enter")
 
@@ -1638,6 +1696,10 @@ def main():
     tx_dev.add_argument("--priority", "-p", type=int, default=1)
     tx_dev.add_argument("--no-task", action="store_true",
                         help="Skip creating a beads task for this dev")
+    tx_dev.add_argument("--force", action="store_true",
+                        help="Add a duplicate task/window even if one exists "
+                             "for this slug, or re-send --launch into a "
+                             "running pane. Rarely what you want.")
 
     tx_review = txsub.add_parser("review",
                                   help="Spawn the long-lived reviewer window")
