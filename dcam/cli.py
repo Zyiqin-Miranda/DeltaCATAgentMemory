@@ -374,6 +374,10 @@ def cmd_orchestrate(args):
 def cmd_tmux_start(args):
     from dcam import tmux
     project_path = args.project or os.getcwd()
+    if args.launch:
+        # Pre-accept Claude's first-run prompts so the manager pane
+        # doesn't get stuck on the theme picker / trust dialog.
+        claude_code.bootstrap_claude_first_run(project_path)
     cmd = tmux.build_manager_launch_cmd(args.claude_bin) if args.launch else None
     name = tmux.start_session(args.session, project_path, manager_cmd=cmd)
     print(f"✓ tmux session '{name}' ready (window: manager)")
@@ -393,6 +397,8 @@ def cmd_tmux_dev(args):
     project_path = args.project or os.getcwd()
     slug = tmux.slugify(args.slug)
     brief = args.brief
+    if args.launch:
+        claude_code.bootstrap_claude_first_run(project_path)
 
     # --- Idempotency: reuse existing task + window for this slug -----------
     # Pre-2026-05-27 behavior was unconditionally additive: re-running
@@ -490,6 +496,8 @@ def cmd_tmux_review(args):
     from dcam.reviews import bootstrap_context
 
     project_path = args.project or os.getcwd()
+    if args.launch:
+        claude_code.bootstrap_claude_first_run(project_path)
     # Pull the reviewer's accumulated learning into the startup prompt
     # so each new reviewer-session knows what prior reviewers learned.
     store = get_store(args.namespace, args.search_backend, args.catalog,
@@ -1268,10 +1276,30 @@ def cmd_claude_init(args):
     print(f"✓ DeltaCAT tables initialized (namespace: {args.namespace})")
     print(f"✓ Claude Code hook: {hook_path}")
     print(f"✓ Settings updated: {settings_path}")
+    # Pre-accept first-run prompts so multi-agent launches don't block.
+    bs = claude_code.bootstrap_claude_first_run(project_path)
+    if bs.get("changed"):
+        print(f"✓ Bootstrapped Claude first-run state: {', '.join(bs['changed'])}")
+    elif bs.get("skipped"):
+        print(f"⚠ Skipped first-run bootstrap: {bs.get('reason')}")
     # Do initial sync
     synced = claude_code.sync_all_sessions(store, project_path)
     if synced:
         print(f"✓ Synced {synced} existing sessions")
+
+
+def cmd_claude_bootstrap(args):
+    """Idempotently pre-accept Claude Code's theme picker + trust dialog."""
+    project_path = args.project or os.getcwd()
+    bs = claude_code.bootstrap_claude_first_run(project_path,
+                                                theme=args.theme)
+    if bs.get("skipped"):
+        print(f"⚠ Skipped: {bs['reason']}")
+        sys.exit(1)
+    if bs.get("changed"):
+        print(f"✓ Updated {bs['path']}: {', '.join(bs['changed'])}")
+    else:
+        print(f"✓ Already bootstrapped at {bs['path']}; nothing to do.")
 
 
 def cmd_claude_sync(args):
@@ -1677,6 +1705,16 @@ def main():
                       default=None,
                       help="Persist promoted records to CLAUDE.md/AGENTS.md")
 
+    ccbs = ccsub.add_parser(
+        "bootstrap",
+        help="Pre-accept Claude Code's theme picker + trust dialog so "
+             "multi-agent --launch flows don't block on prompts")
+    ccbs.add_argument("--project", default=None,
+                      help="Project path to mark trusted (default: cwd)")
+    ccbs.add_argument("--theme", default="dark",
+                      choices=["dark", "light", "auto"],
+                      help="Theme to set if no preference exists yet")
+
     # orchestrate
     orch_p = sub.add_parser("orchestrate", help="Start orchestration loop")
     orch_p.add_argument("--interval", type=int, default=10, help="Poll interval in seconds")
@@ -1978,6 +2016,7 @@ def main():
         {"init": cmd_claude_init, "sync": cmd_claude_sync, "list": cmd_claude_list,
          "recall": cmd_claude_recall, "search": cmd_claude_search,
          "context": cmd_claude_context,
+         "bootstrap": cmd_claude_bootstrap,
          "extract": cmd_claude_extract,
          "extract-review": cmd_claude_extract_review}.get(args.claude_cmd, lambda _: cc_p.print_help())(args)
     elif args.command == "branch":

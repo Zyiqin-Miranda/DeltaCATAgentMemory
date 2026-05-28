@@ -19,6 +19,70 @@ from dcam.store import DeltaStore
 CLAUDE_DIR = Path.home() / ".claude"
 PROJECTS_DIR = CLAUDE_DIR / "projects"
 HISTORY_FILE = CLAUDE_DIR / "history.jsonl"
+# Top-level user state for Claude Code (separate from CLAUDE_DIR/settings.json
+# which holds machine-wide preferences). The first-run flags (theme picker
+# and per-project trust dialog) live here.
+CLAUDE_USER_STATE = Path.home() / ".claude.json"
+
+
+def bootstrap_claude_first_run(project_path: str,
+                               theme: str = "dark") -> dict:
+    """Pre-accept Claude Code's first-run prompts so launches don't block.
+
+    Claude Code shows two interactive prompts on first run that block
+    everything until the user answers them at the keyboard:
+
+    1. Theme picker (one-time per user account).
+    2. "Trust this folder?" dialog (one-time per project directory).
+
+    For multi-agent orchestration (`dcam tmux start/dev/review --launch`)
+    the agents run unattended, so a blocking prompt = a stuck workflow.
+
+    This function idempotently sets the relevant flags in
+    ``~/.claude.json``:
+
+    - ``hasCompletedOnboarding: true``
+    - ``theme: "<theme>"`` (default ``dark``; honored only if the user
+      has not already set their own preference)
+    - ``projects[<abs_path>].hasTrustDialogAccepted: true``
+
+    Returns a dict describing what was changed (for the CLI to report).
+    """
+    import json as _json
+    project_path = str(Path(project_path).resolve())
+
+    state: dict = {}
+    if CLAUDE_USER_STATE.exists():
+        try:
+            state = _json.loads(CLAUDE_USER_STATE.read_text() or "{}")
+        except _json.JSONDecodeError:
+            # Don't clobber a malformed file silently. The user can fix
+            # it; we just skip the bootstrap rather than corrupt it.
+            return {"path": str(CLAUDE_USER_STATE),
+                    "skipped": True,
+                    "reason": "existing ~/.claude.json is not valid JSON"}
+
+    changed: list = []
+
+    if not state.get("hasCompletedOnboarding"):
+        state["hasCompletedOnboarding"] = True
+        changed.append("hasCompletedOnboarding")
+
+    # Only set theme if the user hasn't picked one already.
+    if "theme" not in state:
+        state["theme"] = theme
+        changed.append(f"theme={theme}")
+
+    projects = state.setdefault("projects", {})
+    pstate = projects.setdefault(project_path, {})
+    if not pstate.get("hasTrustDialogAccepted"):
+        pstate["hasTrustDialogAccepted"] = True
+        changed.append(f"trusted:{project_path}")
+
+    if changed:
+        CLAUDE_USER_STATE.write_text(_json.dumps(state, indent=2) + "\n")
+
+    return {"path": str(CLAUDE_USER_STATE), "changed": changed}
 
 
 def find_project_dir(project_path: str) -> Optional[Path]:
