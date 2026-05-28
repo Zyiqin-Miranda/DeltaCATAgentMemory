@@ -266,6 +266,13 @@ def spawn_dev_window(session: str, slug: str, project_path: str,
     if window_name not in list_windows(session):
         _run(["new-window", "-t", session, "-n", window_name, "-c",
               project_path], check=True)
+        # Belt-and-suspenders: explicitly rename the just-created window.
+        # Reports from tmux 3.4 show that under some race conditions
+        # `new-window -n <name>` produces a window whose actual name has
+        # a trailing dash (tmux's status disambiguator) even though the
+        # request was clean. Renaming after creation bypasses that path.
+        # No-op if the name is already correct.
+        _run(["rename-window", "-t", target, window_name])
 
     if dev_cmd:
         _send_launch(target, dev_cmd)
@@ -284,6 +291,7 @@ def spawn_review_window(session: str, project_path: str,
     if "review" not in list_windows(session):
         _run(["new-window", "-t", session, "-n", "review", "-c", project_path],
              check=True)
+        _run(["rename-window", "-t", target, "review"])
     if review_cmd:
         _send_launch(target, review_cmd)
     return target
