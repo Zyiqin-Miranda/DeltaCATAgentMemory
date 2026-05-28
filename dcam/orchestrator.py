@@ -112,7 +112,8 @@ def add_dependency(blocker_id: str, blocked_id: str) -> bool:
 
 def comment_task(task_id: str, text: str):
     """Add a comment to a task."""
-    _run_bd(["comment", task_id, text[:500]])
+    # See dcam.bridge.comment_issue for the `comments add` rationale.
+    _run_bd(["comments", "add", task_id, text[:500]])
 
 
 # --- Agent Dispatch ---
