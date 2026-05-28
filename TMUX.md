@@ -208,11 +208,19 @@ automate the copy; not implemented yet.
 ## Prerequisites
 
 - DCAM installed (`pip install -e .` from the repo root).
-- `tmux` ≥ 3.0 (`brew install tmux` on macOS).
+- `tmux` ≥ 1.8 supported (Amazon Linux 2's default). For best
+  experience use `tmux` ≥ 3.0:
+  - macOS: `brew install tmux`.
+  - AL2: `sudo amazon-linux-extras enable epel && sudo yum install -y tmux3`,
+    or build from source.
+  Older versions work for `start/dev/review/send/capture` but may show
+  cosmetic quirks (e.g. window-name disambiguation flags) that DCAM
+  works around with explicit `rename-window` calls.
 - The `claude` CLI on `$PATH`.
-- Optional: `bd` (beads) for task tracking + dependency graph. DCAM falls
-  back to silent no-ops if `bd` is not initialized in the project, so you
-  can try the workflow without it.
+- Optional: `bd` (beads) for task tracking + dependency graph. DCAM
+  auto-runs `bd init` from `dcam project init` when bd is on PATH but
+  no `.beads/` exists in the repo. If bd is missing entirely, DCAM
+  surfaces a one-line warning explaining what won't work.
 
 Each window's session is auto-synced to DCAM at end via the SessionEnd
 hook installed by `dcam claude init`. Run that once per project before
