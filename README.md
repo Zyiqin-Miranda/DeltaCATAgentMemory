@@ -41,13 +41,25 @@ pip install -e '.[deltacat]'
 ### Prerequisites
 
 - Python ≥ 3.9
-- [pyarrow](https://arrow.apache.org/docs/python/) ≥ 14.0
+- [pyarrow](https://arrow.apache.org/docs/python/) ≥ 20.0 — installed automatically; pulls a prebuilt manylinux/macos/windows wheel
 - Optional, but at least one of:
   - [Claude Code](https://docs.claude.com/en/docs/claude-code) — sessions auto-sync via the installed `SessionEnd` hook
   - [Kiro](https://github.com/Zyiqin-Miranda/Kiro) — pre-tool hook + AGENTS.md integration
 - Optional: [deltacat](https://github.com/ray-project/deltacat) for ACID-compliant storage
 - Optional: [beads](https://github.com/steveyegge/beads) (`bd` CLI) for task tracking
 - Optional: `tmux` ≥ 3.0 for the multi-agent workflow
+
+### Forcing wheels (locked-down Pythons)
+
+Some hosts ship a Python (e.g. `/apollo/env/envImprovement/bin/python3.10`)
+that resolves an older `pyarrow` constraint than DCAM declares and tries
+to build from source — which fails without a C++ toolchain. If your
+plain `pip install -e .` ends in `Failed building wheel for pyarrow`,
+force pip to refuse source builds:
+
+```bash
+pip install --user --only-binary=pyarrow -e .
+```
 
 ## Quick Start
 
