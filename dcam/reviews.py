@@ -38,6 +38,14 @@ def _notify_reviewer_window(session: Optional[str], message: str):
     Silent if tmux isn't running, the session doesn't exist, or the
     review window hasn't been spawned. The persistent review_request
     row is the durable channel — this is just the live ping.
+
+    Sends two lines:
+    1. The notification itself, NOT comment-prefixed, so the reviewer
+       Claude treats it as a real prompt and acts on it. (Pre-2026-05-28
+       we sent ``# <msg>`` which Claude treated as inert ambient text;
+       requests sat unprocessed for tens of minutes.)
+    2. An explicit "drain pending" instruction so the agent knows what
+       command to run.
     """
     if not session:
         return
@@ -47,10 +55,18 @@ def _notify_reviewer_window(session: Optional[str], message: str):
             return
         if "review" not in tmux_mod.list_windows(session):
             return
-        # Send as a comment-prefixed line so an attached agent sees it
-        # but it doesn't get interpreted as a command if the pane is at
-        # a shell prompt.
-        tmux_mod.send_keys(session, "review", f"# {message}")
+        # Two-line prompt. The first line is the human-readable
+        # notification; the second is the explicit instruction the agent
+        # acts on. send_keys appends Enter by default, which submits.
+        tmux_mod.send_keys(session, "review",
+                           f"[review-request] {message}")
+        tmux_mod.send_keys(
+            session, "review",
+            "Drain pending review requests now: "
+            "`dcam tmux reviews pending`, then `reviews show <id>`, "
+            "`reviews claim <id>`, do the review, and "
+            "`reviews complete <id> --summary \"...\" --persist claude`.",
+        )
     except Exception:
         # Any failure here should never break the request.
         pass
