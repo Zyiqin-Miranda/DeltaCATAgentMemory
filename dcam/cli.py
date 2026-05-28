@@ -21,6 +21,7 @@ Usage:
 import argparse
 import json
 import os
+import subprocess
 import sys
 import uuid
 from datetime import datetime
@@ -384,6 +385,7 @@ def cmd_tmux_start(args):
 
 def cmd_tmux_dev(args):
     from dcam import tmux
+    from dcam.bridge import bd_available, bd_database_initialized
     from dcam.orchestrator import create_task
 
     project_path = args.project or os.getcwd()
@@ -404,6 +406,20 @@ def cmd_tmux_dev(args):
     print(f"✓ dev window '{target}' ready")
     if task:
         print(f"  Task: {task.id} (label slug:{slug})")
+    elif not args.no_task:
+        # bd was supposed to create a task but didn't. Be loud about why so
+        # the user doesn't hit "No open dev task" later from `tmux update`.
+        if not bd_available():
+            print(f"  ⚠ bd CLI not found; no beads task created. "
+                  f"`dcam tmux update {slug}` and `reviews complete` "
+                  f"will not work until bd is installed.")
+        elif not bd_database_initialized(project_path):
+            print(f"  ⚠ bd is installed but no beads database in {project_path}. "
+                  f"Run `bd init` (or `dcam project init`) and re-run "
+                  f"this command.")
+        else:
+            print(f"  ⚠ Failed to create beads task for slug:{slug}. "
+                  f"Check `bd doctor`.")
     if not args.launch:
         print(f"  To start the dev agent: tmux send-keys -t {target} "
               f"'{tmux.build_dev_launch_cmd(slug, brief, args.claude_bin)}' Enter")
@@ -480,11 +496,29 @@ def cmd_tmux_capture(args):
 
 
 def cmd_tmux_update(args):
+    from dcam.bridge import bd_available, bd_database_initialized
     from dcam.orchestrator import comment_task, list_tasks
     # Find the bd task with matching slug label
     open_tasks = list_tasks(status="open", labels=["role:dev", f"slug:{args.slug}"])
     if not open_tasks:
-        print(f"No open dev task with slug '{args.slug}' found.", file=sys.stderr)
+        # Distinguish "bd not installed", "bd installed but no DB",
+        # "bd installed + DB but slug not found" — each has a different fix.
+        if not bd_available():
+            print(f"No bd CLI found; `dcam tmux update` requires beads.\n"
+                  f"  Install bd: https://github.com/steveyegge/beads",
+                  file=sys.stderr)
+        elif not bd_database_initialized():
+            print(f"No beads database initialized in this directory.\n"
+                  f"  Run `bd init` (or `dcam project init` to bootstrap "
+                  f"both DCAM and beads), then re-run "
+                  f"`dcam tmux dev <session> {args.slug} \"<brief>\"` to "
+                  f"create the task.",
+                  file=sys.stderr)
+        else:
+            print(f"No open dev task with slug '{args.slug}' found.\n"
+                  f"  Did you run `dcam tmux dev <session> {args.slug} "
+                  f"\"<brief>\"` first?",
+                  file=sys.stderr)
         sys.exit(1)
     task = open_tasks[0]
     comment_task(task.id, f"[status] {args.message}")
@@ -1361,6 +1395,7 @@ def cmd_claude_extract_review(args):
 
 
 def cmd_project_init(args):
+    from dcam.bridge import bd_available, bd_database_initialized
     from dcam.project import init_project, discover_root, is_project_root
     repo = args.repo or os.getcwd()
     root = init_project(repo, namespace=args.namespace, force=args.force)
@@ -1368,6 +1403,24 @@ def cmd_project_init(args):
     print(f"  Committed:   decisions.json, lessons.json, sessions.json")
     print(f"  Local-only:  tables/{args.namespace}/  (gitignored)")
     print(f"  Hook source: hooks/pre-commit  (committed; install per clone)")
+
+    # Auto-init the beads database if bd is installed but no .beads/ exists.
+    # `dcam tmux dev/update` rely on bd for task tracking; the pre-2026-05-27
+    # behavior was to silently skip task creation, leading to confusing
+    # "No open dev task" errors later. Bootstrap up front instead.
+    if bd_available() and not bd_database_initialized(str(repo)):
+        try:
+            subprocess.run(["bd", "init"], cwd=repo, check=True,
+                           capture_output=True, text=True, timeout=30)
+            print(f"  Beads:       initialized .beads/ in {repo}")
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
+                FileNotFoundError) as e:
+            print(f"  Beads:       bd is on PATH but `bd init` failed "
+                  f"({e}). Run it manually if you want task tracking.")
+    elif not bd_available():
+        print(f"  Beads:       bd CLI not found. `dcam tmux dev/update` "
+              f"will skip task tracking. Install bd to enable.")
+
     print()
     print("Next steps:")
     print(f"  1. Review {root}/.gitignore and {root}/README.md")
