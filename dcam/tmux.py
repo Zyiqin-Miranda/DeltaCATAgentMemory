@@ -209,24 +209,42 @@ def slugify(text: str) -> str:
 # --- Session lifecycle ------------------------------------------------------
 
 
+def _send_launch(target: str, cmd: str):
+    """Send a launch command to a freshly-created tmux pane.
+
+    Handles two real-world quirks observed during the 2026-05-27
+    bootstrap:
+    - The shell inside a brand-new pane needs a moment to render its
+      prompt; sending a long claude invocation immediately can race and
+      deliver to an unready pane. A short sleep makes this reliable.
+    - send-keys without `check=True` swallowed argument errors in
+      earlier versions; we now check the return code so a busted launch
+      surfaces instead of silently no-op'ing.
+    """
+    import time
+    time.sleep(0.3)
+    _run(["send-keys", "-t", target, cmd, "Enter"], check=True)
+
+
 def start_session(name: str, project_path: str,
                   manager_cmd: Optional[str] = None) -> str:
     """Create a tmux session with a `manager` window and start the manager
     agent there.
 
-    Returns the session name. Idempotent: if the session already exists,
-    returns it unchanged.
+    Returns the session name. Idempotent on the session itself, but the
+    manager_cmd is sent even when the session already existed — that
+    matches `dcam tmux dev`'s reuse-and-launch-on-demand semantics and
+    fixes the silent no-op when the user runs `dcam tmux start --launch`
+    against an already-created session.
     """
     _require_tmux()
-    if session_exists(name):
-        return name
 
-    # New detached session with the manager window
-    _run(["new-session", "-d", "-s", name, "-n", "manager", "-c", project_path],
-         check=True)
+    if not session_exists(name):
+        _run(["new-session", "-d", "-s", name, "-n", "manager", "-c",
+              project_path], check=True)
 
     if manager_cmd:
-        _run(["send-keys", "-t", f"{name}:manager", manager_cmd, "Enter"])
+        _send_launch(f"{name}:manager", manager_cmd)
 
     return name
 
@@ -250,7 +268,7 @@ def spawn_dev_window(session: str, slug: str, project_path: str,
               project_path], check=True)
 
     if dev_cmd:
-        _run(["send-keys", "-t", target, dev_cmd, "Enter"])
+        _send_launch(target, dev_cmd)
 
     return target
 
@@ -267,7 +285,7 @@ def spawn_review_window(session: str, project_path: str,
         _run(["new-window", "-t", session, "-n", "review", "-c", project_path],
              check=True)
     if review_cmd:
-        _run(["send-keys", "-t", target, review_cmd, "Enter"])
+        _send_launch(target, review_cmd)
     return target
 
 

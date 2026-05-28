@@ -377,7 +377,9 @@ def cmd_tmux_start(args):
     cmd = tmux.build_manager_launch_cmd(args.claude_bin) if args.launch else None
     name = tmux.start_session(args.session, project_path, manager_cmd=cmd)
     print(f"✓ tmux session '{name}' ready (window: manager)")
-    if not args.launch:
+    if args.launch:
+        print(f"  ✓ launched manager agent in {name}:manager")
+    else:
         print(f"  To start the manager agent: tmux send-keys -t {name}:manager "
               f"'{tmux.build_manager_launch_cmd(args.claude_bin)}' Enter")
     print(f"  Attach with: tmux attach -t {name}")
@@ -497,13 +499,15 @@ def cmd_tmux_review(args):
            if args.launch else None)
     target = tmux.spawn_review_window(args.session, project_path, review_cmd=cmd)
     print(f"✓ review window '{target}' ready")
-    if extra and args.launch:
-        crit_count = len([l for l in extra.split("\n") if l.startswith("- CP-")])
-        find_count = len([l for l in extra.split("\n") if l.startswith("- L-")])
-        queue_count = len([l for l in extra.split("\n") if l.startswith("- REQ-")])
-        print(f"  Bootstrapped reviewer with {crit_count} critical points, "
-              f"{find_count} prior findings, {queue_count} pending requests.")
-    if not args.launch:
+    if args.launch:
+        print(f"  ✓ launched reviewer agent in {target}")
+        if extra:
+            crit_count = len([l for l in extra.split("\n") if l.startswith("- CP-")])
+            find_count = len([l for l in extra.split("\n") if l.startswith("- L-")])
+            queue_count = len([l for l in extra.split("\n") if l.startswith("- REQ-")])
+            print(f"  Bootstrapped reviewer with {crit_count} critical points, "
+                  f"{find_count} prior findings, {queue_count} pending requests.")
+    else:
         print(f"  To start the reviewer: tmux send-keys -t {target} "
               f"'{tmux.build_reviewer_launch_cmd(args.claude_bin)}' Enter")
 
