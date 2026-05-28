@@ -215,9 +215,30 @@ def is_project_root(path: Path) -> bool:
     return path != home
 
 
+def _walk_up_for_git(start: Path) -> Optional[Path]:
+    """Walk up from `start` looking for a `.git/` directory or file.
+
+    Returns the path that contains `.git`, or None if filesystem root is
+    reached. `.git` is a file in submodule worktrees (gitlink), so the
+    `.is_dir()` check needs to also accept files.
+    """
+    cur = start.resolve()
+    while True:
+        candidate = cur / ".git"
+        if candidate.exists():
+            return cur
+        if cur.parent == cur:
+            return None
+        cur = cur.parent
+
+
 def init_project(repo_path: str, namespace: str = "dcam",
                  force: bool = False) -> Path:
     """Create `<repo>/.dcam/` with the standard layout.
+
+    Refuses to run outside a git repo unless `force=True`. Project mode's
+    whole value prop is committable memory; without git, the JSON files
+    can't be reviewed in PRs and the pre-commit hook can't fire.
 
     - Drops a README explaining what each file is.
     - Drops a .gitignore so `tables/` stays local.
@@ -232,6 +253,18 @@ def init_project(repo_path: str, namespace: str = "dcam",
     repo = Path(repo_path).resolve()
     if not repo.exists():
         raise FileNotFoundError(f"{repo} does not exist")
+
+    if not force and _walk_up_for_git(repo) is None:
+        raise RuntimeError(
+            f"{repo} is not inside a git repository.\n"
+            f"  Project mode requires a git repo so decisions/lessons can\n"
+            f"  be committed and reviewed.\n"
+            f"  - Brazil workspace? Run from the package directory\n"
+            f"    (e.g. src/<Package>), not the workspace root.\n"
+            f"  - Solo / global use? Omit `project init` — DCAM works from\n"
+            f"    ~/.dcam/ by default.\n"
+            f"  - Override with --force if you really want a `.dcam/` here."
+        )
 
     root = repo / PROJECT_DIR_NAME
     root.mkdir(exist_ok=True)
