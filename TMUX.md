@@ -273,6 +273,110 @@ Window naming is the contract. All commands key off these names:
 `<slug>` is auto-derived from the task title via `slugify()`: `Auth
 Flow refactor!!` → `auth-flow-refactor`.
 
+## Architectures: all-in-one vs. hybrid
+
+Pick the architecture that matches your environment **before** running
+any of the commands below. The wrong choice doesn't break things
+catastrophically, but the hybrid is dramatically more resilient for
+the common Amazon-internal "Mac + remote cloud desk" setup.
+
+### All-in-one (single host)
+
+Manager + dev + reviewer all live in one tmux session on one host.
+
+```
+┌─ tmux session: <project> ─────────────────────────────────┐
+│  manager  │  dev-foo  │  dev-bar  │  review               │
+└───────────────────────────────────────────────────────────┘
+```
+
+Best when:
+
+- You're on a single laptop with the codebase, tools, and credentials
+  all local. No SSH layer, no remote auth.
+- You're doing quick iteration where losing the whole team to a
+  credential expiry or a host crash is OK.
+
+### Hybrid: local manager + remote workers (recommended for cloud desks)
+
+The manager runs on your local Mac in your interactive terminal. The
+dev and reviewer agents run on the remote cloud desk where the code
+and build tools are. The manager talks to the remote workers over
+SSH, polling state via `dcam` and (optionally) reading the live event
+stream via `dcam tmux watch`.
+
+```
+Local Mac:                                Remote dev desk:
+┌──────────────────────────────────┐      ┌─────────────────────────────────────┐
+│ Manager Claude                   │ SSH  │ tmux session (dev + reviewer only)  │
+│ - In user's terminal             │ ───► │ ┌─────────────┐  ┌────────────────┐ │
+│ - Polls dev/reviewer panes       │      │ │ Dev Claude  │  │ Reviewer Claude│ │
+│ - Reads DCAM state via SSH       │      │ │ + codebase  │  │ + codebase     │ │
+│ - Surfaces P1 issues to user     │      │ └─────────────┘  └────────────────┘ │
+│   directly via terminal          │      │                                     │
+│ - Manages cross-host signaling   │      │ DCAM state: <repo>/.dcam/           │
+│   when dev desk creds expire     │      │ Workers SSH-accessible              │
+└──────────────────────────────────┘      └─────────────────────────────────────┘
+```
+
+Why this matches reality for Amazon-internal users:
+
+- **Credential expiry.** When AWS / midway tokens expire on the dev
+  desk, every agent in an all-in-one session dies at once. The
+  manager — the agent meant to *surface* auth issues — dies along
+  with the workers. With a local manager, the manager stays alive
+  and notices `bd list` failing across SSH; it can ask the user to
+  refresh tokens directly in the terminal the user is already
+  watching.
+
+- **Out-of-band channel to the user.** A local manager already runs
+  in the user's terminal. It doesn't need a tmux pane the user must
+  attach to. P1 issues surface synchronously.
+
+- **Resilience to per-host failures.** Reboot the dev desk; the
+  manager survives and can re-establish coordination. Bug 14 (bd
+  Dolt corruption) becomes a recovery loop instead of a total loss.
+
+- **Role-fit.** Workers need codebase, build tools, IDE-equivalents
+  → must be where the code is. The manager needs SSH, DCAM read
+  access, and a terminal to talk to the user → must be where the
+  user is.
+
+### Running the hybrid pattern
+
+Worker side, on the remote dev desk:
+
+```bash
+# As normal — start the tmux session and spawn workers there.
+ssh dev-desk
+cd /path/to/repo
+dcam project init                       # if not already
+dcam tmux start <project>
+dcam tmux dev <project> auth   "Auth refactor"      --launch
+dcam tmux dev <project> api    "Wire /v2/sessions"  --launch
+dcam tmux review <project>                          --launch
+detach the tmux session and disconnect.
+```
+
+Manager side, on the local Mac:
+
+```bash
+# Open a fresh terminal pane. Run the manager Claude here.
+claude --append-system-prompt "You are the manager. Watch the remote
+team via 'ssh dev-desk dcam --root /path/to/repo/.dcam tmux watch
+<project>'. Surface blockers to the user. Tell devs to refresh
+credentials when bd starts failing."
+```
+
+The manager Claude stays attached to your terminal. It reads remote
+state via repeated SSH calls; the live event stream comes from
+`dcam tmux watch <project>` (newline-delimited JSON, one event per
+state change). The manager doesn't need to be a tmux pane on the
+remote box — it lives where you do.
+
+If you prefer the all-in-one pattern despite the trade-offs, the
+Quick Start below works as-is on a single host.
+
 ## Quick start (five commands)
 
 ```bash
@@ -475,6 +579,55 @@ Output covers:
 
 Useful for the manager at the top of each day instead of running
 `tmux capture-pane` against every dev window.
+
+## Live event stream: `dcam tmux watch <session>`
+
+`digest` is a one-shot snapshot. For the hybrid (local manager +
+remote workers) architecture you usually want a *stream*: the local
+manager Claude reads remote state continuously and acts on changes as
+they happen, instead of polling.
+
+```bash
+# On the manager-side (typically your local Mac), running over SSH:
+ssh dev-desk dcam --root /path/to/repo/.dcam tmux watch <session>
+```
+
+The command emits **newline-delimited JSON** to stdout. The first
+line is always a `snapshot` event carrying full current state, so a
+manager that just connected sees the world. Subsequent lines are
+deltas, one per affected entity.
+
+### Event shape
+
+```json
+{"ts": "2026-05-29T...", "kind": "snapshot", "session": "<name>", "state": {...}}
+{"ts": "2026-05-29T...", "kind": "decisions_added",        "id": "DEC-2", "data": {...}}
+{"ts": "2026-05-29T...", "kind": "decisions_changed",      "id": "DEC-1", "data": {...}}
+{"ts": "2026-05-29T...", "kind": "review_requests_added",  "id": "REQ-3", "data": {...}}
+{"ts": "2026-05-29T...", "kind": "dev_tasks_changed",      "id": "<bd-task-id>", "data": {...}}
+{"ts": "2026-05-29T...", "kind": "critical_points_added",  "id": "CP-4", "data": {...}}
+{"ts": "2026-05-29T...", "kind": "handoffs_added",         "id": "HO-2", "data": {...}}
+{"ts": "2026-05-29T...", "kind": "shutdown"}
+```
+
+`kind` is always `<entity>_<change>` where:
+- `<entity>` is one of: `review_requests`, `decisions`, `critical_points`,
+  `dev_tasks`, `specs`, `handoffs`, `reviews`.
+- `<change>` is one of: `added`, `changed`, `removed`. (`changed`
+  fires when *any* tracked field on the entity differs from the
+  previous snapshot.)
+
+The `dev_tasks_changed` event is especially useful for the manager —
+it surfaces the dev's most recent `[status]` bd comment without the
+manager having to `tmux capture-pane` against the dev window.
+
+Flags:
+- `--interval N` — poll every N seconds (default 5).
+- `--once` — emit a single `snapshot` and exit; useful for cron-style
+  polling or one-shot SSH calls.
+
+The watch loop runs until interrupted (Ctrl-C or SIGTERM) and emits a
+final `shutdown` event.
 
 ## Long-running reviewer agent
 
@@ -877,6 +1030,7 @@ The parquet rows are the source of truth.
 | `critical list [--status active\|retired]`        | any   | List critical points                                      |
 | `critical retire <id> [--reason --persist]`       | any   | Retire a critical point (kept in JSON for audit)          |
 | `digest [--recent-lessons N]`                     | any   | Standup snapshot: dev status, open decisions, lessons, CPs|
+| `watch <session> [--interval N --once]`           | mgr   | Long-running NDJSON event stream (snapshot + diffs)       |
 | `request-review <slug> [--notes --files --decisions --epic --op --ticket --tmux-session]` | dev | File a review request; live-notify the reviewer window  |
 | `reviews pending`                                 | any   | List pending + claimed review requests                    |
 | `reviews show <id>`                               | any   | Show a request and its review (if completed)              |

@@ -689,6 +689,166 @@ def cmd_tmux_lesson(args):
         print(f"  persisted to {args.persist}")
 
 
+def _watch_snapshot(store):
+    """Build a single watchable-state snapshot.
+
+    Returns a dict whose keys are entity kinds and whose values are
+    dicts keyed by id (so diff can identify adds/removes/changes by id).
+    Field selection prioritizes what a manager-on-local needs to see —
+    not full content, just signal.
+    """
+    from dcam.orchestrator import list_tasks, _run_bd
+
+    snap = {
+        "review_requests": {},
+        "decisions": {},
+        "critical_points": {},
+        "dev_tasks": {},
+        "specs": {},
+        "handoffs": {},
+        "reviews": {},
+    }
+
+    for r in store.read_review_requests():
+        if r.status.value in ("done", "withdrawn"):
+            continue
+        snap["review_requests"][f"REQ-{r.id}"] = {
+            "slug": r.slug, "status": r.status.value,
+            "epic": r.epic, "op": r.op,
+            "notes": (r.notes or "")[:120],
+            "created_at": r.created_at.isoformat(),
+        }
+
+    for d in store.read_decisions():
+        if d.status.value not in ("open", "decided"):
+            continue
+        snap["decisions"][f"DEC-{d.id}"] = {
+            "title": d.title, "status": d.status.value,
+            "epic": d.epic, "op": d.op,
+            "chosen": d.chosen,
+            "requested_by": d.requested_by,
+        }
+
+    for cp in store.read_critical_points(status="active"):
+        snap["critical_points"][f"CP-{cp.id}"] = {
+            "content": cp.content[:120], "epic": cp.epic, "op": cp.op,
+        }
+
+    for s in store.read_specs():
+        snap["specs"][f"SP-{s.id}"] = {
+            "path": s.path, "epic": s.epic, "op": s.op,
+            "linked_decision": s.last_linked_decision_id,
+        }
+
+    for h in store.read_handoffs():
+        if h.status.value == "withdrawn":
+            continue
+        snap["handoffs"][f"HO-{h.id}"] = {
+            "from": h.from_slug, "to": h.to_slug,
+            "status": h.status.value,
+            "epic": h.epic, "op": h.op,
+            "notes": (h.notes or "")[:120],
+        }
+
+    for rv in store.read_reviews():
+        snap["reviews"][f"RV-{rv.id}"] = {
+            "request_id": rv.request_id,
+            "blocking": rv.blocking_findings,
+            "advisory": rv.advisory_findings,
+        }
+
+    # Per-dev task status: pull each dev task + most recent [status] comment
+    # so the manager sees the latest checkpoint without polling N panes.
+    try:
+        dev_tasks = list_tasks(status="open", labels=["role:dev"])
+    except Exception:
+        dev_tasks = []
+    for t in dev_tasks:
+        slug = next((l.split(":", 1)[1] for l in t.labels
+                     if l.startswith("slug:")), None)
+        latest_status = ""
+        try:
+            show = _run_bd(["show", t.id, "--json"])
+            if isinstance(show, dict):
+                comments = show.get("comments", []) or []
+                for c in reversed(comments):
+                    body = (c.get("body") or "").strip()
+                    if body.startswith("[status]"):
+                        latest_status = body[len("[status]"):].strip()[:120]
+                        break
+        except Exception:
+            pass
+        snap["dev_tasks"][t.id] = {
+            "slug": slug, "title": t.title[:80],
+            "latest_status": latest_status,
+        }
+
+    return snap
+
+
+def _watch_diff(prev, curr):
+    """Yield (kind, change_type, eid, data) tuples for what changed."""
+    for kind in curr:
+        prev_kind = prev.get(kind, {}) if prev else {}
+        for eid, data in curr[kind].items():
+            if eid not in prev_kind:
+                yield (kind, "added", eid, data)
+            elif prev_kind[eid] != data:
+                yield (kind, "changed", eid, data)
+        for eid in prev_kind:
+            if eid not in curr[kind]:
+                yield (kind, "removed", eid, prev_kind[eid])
+
+
+def cmd_tmux_watch(args):
+    """Long-running event stream over DCAM state changes.
+
+    Designed for a manager-on-local + workers-on-remote architecture
+    (see TMUX.md "Architectures"). The local manager runs:
+
+        ssh dev-desk dcam --root /repo/.dcam tmux watch <session>
+
+    and consumes the resulting newline-delimited JSON stream.
+
+    The first event is always a `snapshot` carrying the full current
+    state — so a manager that just connected sees what's already
+    happening. Subsequent events are individual `added` / `changed` /
+    `removed` deltas, one per affected entity.
+    """
+    import time
+    from datetime import datetime as _dt
+
+    store = get_store(args.namespace, args.search_backend, args.catalog,
+                      getattr(args, "branch", "main"),
+                      getattr(args, "root", None))
+
+    def emit(event):
+        event["ts"] = _dt.now().isoformat()
+        # Compact one-line JSON. Stream consumers parse line by line.
+        sys.stdout.write(json.dumps(event, default=str) + "\n")
+        sys.stdout.flush()
+
+    initial = _watch_snapshot(store)
+    emit({"kind": "snapshot", "session": args.session, "state": initial})
+    if args.once:
+        return
+
+    prev = initial
+    try:
+        while True:
+            time.sleep(args.interval)
+            try:
+                curr = _watch_snapshot(store)
+            except Exception as e:
+                emit({"kind": "error", "message": str(e)})
+                continue
+            for kind, change, eid, data in _watch_diff(prev, curr):
+                emit({"kind": f"{kind}_{change}", "id": eid, "data": data})
+            prev = curr
+    except KeyboardInterrupt:
+        emit({"kind": "shutdown"})
+
+
 def cmd_tmux_request_review(args):
     from dcam import reviews
     store = get_store(args.namespace, args.search_backend, args.catalog,
@@ -1874,6 +2034,17 @@ def main():
     tx_dig.add_argument("--recent-lessons", type=int, default=5,
                         help="How many recent lessons to surface (default: 5)")
 
+    tx_watch = txsub.add_parser(
+        "watch",
+        help="Long-running NDJSON event stream of DCAM state changes "
+             "(designed for a local manager consuming over SSH)")
+    tx_watch.add_argument("session",
+                          help="tmux session name (used in event metadata only)")
+    tx_watch.add_argument("--interval", type=int, default=5,
+                          help="Polling interval in seconds (default: 5)")
+    tx_watch.add_argument("--once", action="store_true",
+                          help="Emit a single snapshot event and exit")
+
     # Review-request workflow
     tx_rreq = txsub.add_parser("request-review",
                                help="Dev asks the reviewer for feedback")
@@ -2057,6 +2228,7 @@ def main():
                 "lesson": cmd_tmux_lesson, "persist": cmd_tmux_persist,
                 "msg": cmd_tmux_msg, "dep": cmd_tmux_dep, "deps": cmd_tmux_deps,
                 "digest": cmd_tmux_digest,
+                "watch": cmd_tmux_watch,
                 "request-review": cmd_tmux_request_review,
             }
             if args.tmux_cmd == "decisions":
