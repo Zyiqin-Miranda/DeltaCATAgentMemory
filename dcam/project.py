@@ -301,6 +301,57 @@ def init_project(repo_path: str, namespace: str = "dcam",
     return root
 
 
+def exclude_beads_via_git_info(repo_path: str) -> Optional[Path]:
+    """Append ``.beads/`` to ``<repo>/.git/info/exclude`` (idempotent).
+
+    Why not ``.gitignore``? That file is committed; we don't want to
+    speak for the project's gitignore policy. ``.git/info/exclude`` is
+    per-clone, uncommitted, and serves the exact purpose: tell git "for
+    me, this path is untracked-and-stays-that-way."
+
+    The reason this matters is Bug 14: ``git stash --include-untracked``
+    sweeps untracked files into the stash, then ``git stash pop``
+    re-creates them. For a live Dolt sql-server backing ``.beads/``,
+    that round-trip corrupts the on-disk store and trips bd's circuit
+    breaker into an unrecoverable open state.
+
+    Listing ``.beads/`` in ``.git/info/exclude`` makes git treat the
+    directory as ignored (not just untracked), which removes it from
+    the stash sweep. Returns the path written to, or None if there's
+    no ``.git`` dir.
+    """
+    repo = Path(repo_path).resolve()
+    git_dir = repo / ".git"
+    if not git_dir.exists():
+        return None
+    info_dir = git_dir / "info"
+    info_dir.mkdir(exist_ok=True)
+    exclude_path = info_dir / "exclude"
+    line = ".beads/"
+    existing = exclude_path.read_text() if exclude_path.exists() else ""
+    if any(stripped == line for stripped in
+           (l.strip() for l in existing.splitlines())):
+        return exclude_path
+    if existing and not existing.endswith("\n"):
+        existing += "\n"
+    existing += f"{line}\n"
+    exclude_path.write_text(existing)
+    return exclude_path
+
+
+def detect_global_beads() -> Optional[Path]:
+    """Return ``~/.beads/`` if it exists.
+
+    A pre-existing global beads installation collides with project-mode
+    bd in a way that contributes to Bug 14: stale ``dolt-server.pid``
+    files in ``~/.beads/`` claim a server that doesn't exist, and the
+    in-repo bd CLI looks at the global state during recovery probes.
+    Detect it so we can surface a one-line warning at ``project init``.
+    """
+    p = Path.home() / ".beads"
+    return p if p.is_dir() else None
+
+
 def install_hook(repo_path: str, force: bool = False) -> Path:
     """Symlink `<repo>/.git/hooks/pre-commit` to `<repo>/.dcam/hooks/pre-commit`.
 

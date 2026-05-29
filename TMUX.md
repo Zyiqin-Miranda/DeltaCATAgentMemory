@@ -757,6 +757,91 @@ dcam tmux persist --target agents        # AGENTS.md only
 dcam tmux persist --target both          # both files
 ```
 
+## Recovering from a corrupted bd database
+
+If `bd list` (or anything else that touches the beads database) starts
+failing with messages like:
+
+```
+[circuit-breaker] port 0: open → open (active probe failed, cooldown reset)
+Error: failed to open database: dolt circuit breaker is open
+```
+
+…the in-repo Dolt sql-server backing `.beads/` has been corrupted. The
+single most common trigger is a `git stash --include-untracked` cycle
+that swept the live `.beads/` directory into a stash and popped it
+back. The Dolt store does not survive that.
+
+`dcam project init` (since the 2026-05-29 fixes) writes `.beads/` to
+`<repo>/.git/info/exclude`, which makes git treat `.beads/` as ignored
+for stash purposes. If your repo was initialized before that fix, run:
+
+```bash
+dcam project init --force            # idempotent; just refreshes the exclude
+grep -F '.beads/' .git/info/exclude  # should print '.beads/'
+```
+
+### Recovery procedure (when prevention is too late)
+
+1. Stop every Dolt sql-server process associated with bd.
+
+   ```bash
+   bd dolt stop || true
+   pkill -f "dolt sql-server" || true
+   ```
+
+2. Remove stale pid/port/lock files in the repo and (often the
+   actual culprit) in your home directory.
+
+   ```bash
+   rm -f ./.beads/dolt-server.pid \
+         ./.beads/dolt-server.port \
+         ./.beads/dolt-server.lock \
+         ~/.beads/dolt-server.pid \
+         ~/.beads/dolt-server.port \
+         ~/.beads/dolt-server.lock
+   ```
+
+3. If the in-repo Dolt store is unrecoverable, blow it away. **You
+   lose bd task history if you skipped backups.** DCAM's JSON-backed
+   state (decisions, lessons, critical points, specs, handoffs,
+   reviews) is unaffected — it's stored in `.dcam/*.json`.
+
+   ```bash
+   rm -rf .beads/dolt
+   ```
+
+4. Re-init.
+
+   ```bash
+   bd init
+   dcam project init --force          # re-applies .git/info/exclude
+   ```
+
+5. Verify.
+
+   ```bash
+   bd list
+   ```
+
+### Avoiding the global-state collision
+
+If `dcam project init` printed:
+
+```
+⚠ Found competing global beads dir at ~/.beads/.
+```
+
+…you have a per-user beads installation from before project mode. It
+isn't itself broken, but its stale pid/port files can collide with the
+in-repo bd in subtle ways during recovery probes. If recovery keeps
+failing, clean it up:
+
+```bash
+ls ~/.beads/        # confirm it's not actively in use
+rm -rf ~/.beads/    # only if you're not relying on it for some other repo
+```
+
 ## Editing decisions and lessons
 
 The parquet rows are the source of truth.

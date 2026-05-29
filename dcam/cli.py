@@ -1515,6 +1515,23 @@ def cmd_project_init(args):
         print(f"  Beads:       bd CLI not found. `dcam tmux dev/update` "
               f"will skip task tracking. Install bd to enable.")
 
+    # Bug 14 prevention: list .beads/ in .git/info/exclude so
+    # `git stash --include-untracked` doesn't sweep the live Dolt store
+    # into the stash, which corrupts it irreparably on pop.
+    from dcam.project import exclude_beads_via_git_info, detect_global_beads
+    excluded = exclude_beads_via_git_info(str(repo))
+    if excluded is not None:
+        print(f"  Git exclude: .beads/ added to {excluded.relative_to(repo)} "
+              f"(prevents stash --include-untracked corruption)")
+
+    # Bug 14 detection: warn about a competing global ~/.beads/.
+    global_beads = detect_global_beads()
+    if global_beads is not None:
+        print(f"  ⚠ Found competing global beads dir at {global_beads}.\n"
+              f"    Stale pid/port files there can collide with the in-repo\n"
+              f"    bd database (see Bug 14 in TMUX.md). If `bd list` ever\n"
+              f"    fails with 'circuit breaker open', clean ~/.beads/ first.")
+
     print()
     print("Next steps:")
     print(f"  1. Review {root}/.gitignore and {root}/README.md")
