@@ -15,14 +15,16 @@ AI chat sessions are ephemeral — when you close a chat, all context is lost. Y
 - **Project memory** — named, cross-session facts recalled by name from any conversation
 - **Long-term memory** — key facts extracted and recalled with Ebbinghaus decay
 - **Code index** — files summarized into compact chunks, fetched on demand instead of loading full files into context
-- **Decisions and lessons** — first-class records for architectural decisions (with supersession audit trail) and cross-session learnings, rendered as managed sections of `CLAUDE.md`/`AGENTS.md`
+- **Decisions, lessons, and critical points** — first-class records for architectural decisions (with supersession audit trail), cross-session learnings, and forward-looking invariants, all rendered as managed sections of `CLAUDE.md`/`AGENTS.md`
 - **Multi-agent over tmux** — manager / dev / long-running reviewer workflow with pull-based review requests, structured handoffs, peer-to-peer messaging, decision asks, dep tracking, and a digest view ([TMUX.md](TMUX.md))
+- **Hybrid local-manager + remote-workers** — recommended architecture for cloud-desk users: manager runs on the local Mac, dev + reviewer run on the remote dev desk, communication via SSH + a long-running event stream ([TMUX.md § Architectures](TMUX.md#architectures-all-in-one-vs-hybrid))
+- **Live event stream** — `dcam tmux watch <session>` emits NDJSON snapshot + state-change deltas, designed for a local manager Claude to consume over SSH ([TMUX.md § Live event stream](TMUX.md#live-event-stream-dcam-tmux-watch-session))
 - **Specs as versioned artifacts** — register markdown specs anywhere in the repo; DCAM tracks content hash + linked decisions and surfaces drift / NEEDS-UPDATE markers ([TMUX.md § Specs](TMUX.md#specs-as-versioned-artifacts))
 - **Auto-extract from transcripts** — `dcam claude extract` heuristically surfaces lesson/decision/critical-point candidates from a session, with interactive accept/reject promotion
-- **Project mode** — opt-in `<repo>/.dcam/` directory with JSON-as-primary storage so decisions, lessons, and session summaries are committed and reviewable in PRs alongside source code ([TMUX.md § Project mode](TMUX.md#project-mode-committing-memory-alongside-code))
+- **Project mode** — opt-in `<repo>/.dcam/` directory with JSON-as-primary storage so decisions, lessons, critical points, specs, handoffs, reviews, and session summaries are committed and reviewable in PRs alongside source code ([TMUX.md § Project mode](TMUX.md#project-mode-committing-memory-alongside-code))
 - **Pre-commit hook** — auto-regenerates `CLAUDE.md`/`AGENTS.md` managed sections when committed JSON state changes, so docs never drift behind decisions
 - **Task tracking** — sessions linked to Beads issues for persistent task graphs
-- **MCP server** — 15 native tools usable from any MCP-compatible client (Claude Code, Kiro, etc.)
+- **MCP server** — 17 native tools usable from any MCP-compatible client (Claude Code, Kiro, etc.)
 - **Delta storage** — partitioned, append-only deltas with compaction and time-travel
 
 ## Install
@@ -47,7 +49,7 @@ pip install -e '.[deltacat]'
   - [Kiro](https://github.com/Zyiqin-Miranda/Kiro) — pre-tool hook + AGENTS.md integration
 - Optional: [deltacat](https://github.com/ray-project/deltacat) for ACID-compliant storage
 - Optional: [beads](https://github.com/steveyegge/beads) (`bd` CLI) for task tracking
-- Optional: `tmux` ≥ 3.0 for the multi-agent workflow
+- Optional: `tmux` ≥ 1.8 for the multi-agent workflow (≥ 3.0 recommended; AL2 ships 1.8 by default and works for all DCAM tmux subcommands — see [TMUX.md § Prerequisites](TMUX.md#prerequisites))
 
 ### Forcing wheels (locked-down Pythons)
 
@@ -124,8 +126,9 @@ dcam chat start --title "Continue work" --from SESSION_ID
 
 ```bash
 dcam init                    # Create tables, install Kiro hooks, check beads
-dcam claude init             # Install Claude Code SessionEnd hook for this project
-dcam project init            # Create committable .dcam/ for team-shared memory
+dcam claude init             # Install Claude Code SessionEnd hook + first-run bootstrap
+dcam project init            # Create committable .dcam/ + auto bd init + .git/info/exclude
+dcam project install-hook    # Symlink .git/hooks/pre-commit -> .dcam/hooks/pre-commit
 dcam status                  # Show sessions, memories, indexed files, beads status
 dcam project status          # Show active root, mode, and what is stored
 dcam serve                   # Start MCP server (for native tool integration)
@@ -138,7 +141,8 @@ dcam serve                   # Start MCP server (for native tool integration)
 surfaces summaries on demand.
 
 ```bash
-dcam claude init             # Install SessionEnd hook + initial sync
+dcam claude init             # Install SessionEnd hook + initial sync + first-run bootstrap
+dcam claude bootstrap        # Pre-accept theme picker + per-project trust dialog
 dcam claude sync             # Manually sync recent Claude Code sessions
 dcam claude list             # List synced sessions (newest first)
 dcam claude list --full-id   # Show full UUIDs (default truncates to 12 chars)
@@ -147,11 +151,18 @@ dcam claude recall ID -- --resume  # Launch a NEW Claude Code session pre-loaded
 dcam claude search "query"   # BM25 search across all synced Claude Code sessions
 dcam claude context          # Print structured summaries of recent sessions
 dcam claude context --sessions 5 --messages 0  # Just summaries, no message dump
+dcam claude extract <session-id>           # Heuristic lesson/decision/critical extractor
+dcam claude extract-review --persist claude # Interactively accept/reject and promote
 ```
 
 Per-session structured summary includes: first/last user prompt, files
 touched (`Read`/`Edit`/`Write`), commands run (`Bash`), URLs and tickets
 referenced (CR-/SIM-/V-), and errors observed in tool output.
+
+`dcam claude bootstrap` (also auto-called by `dcam tmux start/dev/review
+--launch`) idempotently sets `hasCompletedOnboarding`, `theme`, and the
+per-project `hasTrustDialogAccepted` flag in `~/.claude.json`, so
+launched agents don't block on first-run prompts.
 
 ### Project Memory (cross-session)
 
@@ -230,15 +241,21 @@ claude mcp add dcam dcam serve
 kiro-cli mcp add --name dcam --scope global --command dcam --args serve
 ```
 
-15 tools available via MCP:
+17 tools available via MCP:
 
 | Category | Tools |
 |----------|-------|
 | Memory | `dcam_store_memory`, `dcam_search_memories`, `dcam_project_memory`, `dcam_recall_memory` |
 | Chat | `dcam_recall`, `dcam_list_sessions`, `dcam_search_history` |
+| Claude | `dcam_claude_sync`, `dcam_claude_context` |
 | Code | `dcam_compact`, `dcam_lookup`, `dcam_fetch`, `dcam_fetch_chunk` |
 | Tasks | `dcam_task_create`, `dcam_task_ready`, `dcam_task_complete` |
 | Status | `dcam_status` |
+
+The full multi-agent surface (decisions, critical points, reviews,
+handoffs, specs, watch, …) is exposed via the CLI rather than MCP
+today; agents call them with `Bash` tools. See [TMUX.md](TMUX.md)
+for the command reference.
 
 ## Storage Backends
 
@@ -343,12 +360,17 @@ dcam CLI / MCP Server
   │     ├── chat_sessions           (session metadata + structured summaries)
   │     ├── decisions               (open / decided / superseded / withdrawn, with chain)
   │     ├── lessons                 (cross-session learnings by category)
+  │     ├── critical_points         (forward-looking invariants the reviewer enforces)
+  │     ├── review_requests         (pull-based review queue)
+  │     ├── reviews                 (completed-review audit trail)
+  │     ├── handoffs                (peer-to-peer dev-to-dev transfers)
+  │     ├── specs                   (registered markdown specs + content-hash drift)
   │     ├── compact_chunks          (indexed code chunks with summaries)
   │     └── compact_files           (file-level summaries)
   │
   ├── dcam/search.py           → Pluggable search (BM25 or substring)
   │
-  ├── dcam/mcp_server.py       → MCP server (15 native tools)
+  ├── dcam/mcp_server.py       → MCP server (17 native tools)
   │
   ├── dcam/orchestrator.py     → Multi-agent task orchestration via beads
   │
@@ -358,15 +380,15 @@ dcam CLI / MCP Server
   │
   ├── dcam/extract.py          → Heuristic lesson/decision/critical extraction from transcripts
   │
-  ├── dcam/decisions.py        → Decision lifecycle + CLAUDE.md/AGENTS.md persistence
+  ├── dcam/decisions.py        → Decision/critical/specs/lessons lifecycle + managed-section render
   │
-  ├── dcam/project.py          → Project-mode root discovery + pre-commit hook
+  ├── dcam/project.py          → Project-mode root discovery + pre-commit hook + .git/info/exclude
   │
-  ├── dcam/claude_code.py      → Claude Code JSONL parser + sync + summary heuristics
+  ├── dcam/claude_code.py      → Claude Code JSONL parser + sync + first-run bootstrap
   │
   ├── dcam/json_catalog.py     → JSON-as-primary catalog (committable tables)
   │
-  ├── dcam/bridge.py           → Beads (bd CLI) integration
+  ├── dcam/bridge.py           → Beads (bd CLI) integration; bd_database_initialized() probe
   │
   ├── dcam/compact.py          → Language-aware file indexing
   │
@@ -457,23 +479,49 @@ dcam orchestrate                             # Start the loop
 ```
 
 **2. Interactive tmux team** — `dcam tmux` lays out a manager / dev /
-reviewer session of Claude Code (or any agent CLI), with first-class
-support for decisions, lessons, peer messaging, and dep tracking:
+long-running reviewer session of Claude Code (or any agent CLI), with
+first-class support for decisions, critical points, reviews, handoffs,
+specs, peer messaging, and dep tracking:
 
 ```bash
+# Spawn the team (single-host mode):
 dcam tmux start <session> --launch
 dcam tmux dev <session> <slug> "<brief>" --launch
-dcam tmux ask <slug> "<title>" --options "A:...|B:..."
-dcam tmux decide --id N --choice A --rationale "..." --persist claude
 dcam tmux review <session> --launch
+
+# Decisions, lessons, critical points (rendered into CLAUDE.md/AGENTS.md):
+dcam tmux ask <slug> "<title>" --options "A:...|B:..." --epic <e> --op <o>
+dcam tmux decide --id N --choice A --rationale "..." --persist claude
+dcam tmux critical add "..." --rationale "..." --epic <e> --persist claude
+dcam tmux lesson "..." --category review-finding --epic <e> --persist claude
+
+# Pull-based review requests (replaces send-keys notifications):
+dcam tmux request-review <slug> --notes "..." --tmux-session <session>
+dcam tmux reviews pending|claim <id>|complete <id> --summary "..."
+
+# Peer-to-peer + standup view:
+dcam tmux handoff create <from> <to> --files "..." --notes "..."
+dcam tmux digest
+
+# Live event stream (designed for a local manager consuming via SSH):
+dcam tmux watch <session>          # NDJSON snapshot + state-change deltas
 ```
 
-Decisions, lessons, and per-session structured summaries can be
-committed alongside source code via project mode (`dcam project init`).
-A pre-commit hook keeps `CLAUDE.md`/`AGENTS.md` in sync with the JSON
-state automatically.
+For the **hybrid local-manager + remote-workers** architecture
+(recommended for cloud-desk users — see Bug 15 design notes in
+[TMUX.md § Architectures](TMUX.md#architectures-all-in-one-vs-hybrid)),
+the manager runs on your local Mac in your interactive terminal and
+consumes `dcam tmux watch` over SSH. The `--launch` calls in the
+`tmux dev/review` snippet above run on the remote dev desk; only the
+manager Claude lives locally.
 
-See **[TMUX.md](TMUX.md)** for the full workflow, role prompts, and
+Decisions, lessons, critical points, specs, handoffs, reviews, and
+per-session structured summaries are all committed alongside source
+code via project mode (`dcam project init`). A pre-commit hook keeps
+`CLAUDE.md`/`AGENTS.md` in sync with the JSON state automatically.
+
+See **[TMUX.md](TMUX.md)** for the full workflow, role prompts,
+recovery procedures (including bd-database corruption recovery), and
 end-to-end walkthrough.
 
 ## Running Tests
