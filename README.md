@@ -536,6 +536,33 @@ See **[TMUX.md](TMUX.md)** for the full workflow, role prompts,
 recovery procedures (including bd-database corruption recovery), and
 end-to-end walkthrough.
 
+### What `dcam tmux feed` looks like
+
+```
+┌─ Agents ──────────────────────────┐┌─ Key context ────────────────────────────┐
+│  api          Add /v2/sessions    ││ Open decisions:                          │
+│    → ready for review             ││   BLOCKER DEC-7  [api]  Token storage    │
+│    BLOCKER REQ-3 pending          ││   DEC-8  [auth]  Refresh window length   │
+│                                   ││                                          │
+│  auth         Add OAuth refresh   ││ Active critical points:                  │
+│    → started; tracing handler     ││   CP-1  [api]  Always validate at edges  │
+│                                   ││                                          │
+│                                   ││ Pending handoffs:                        │
+│                                   ││   HO-2  api → auth: shared session shape │
+└───────────────────────────────────┘└──────────────────────────────────────────┘
+┌─ Events (j/k to scroll, q to quit) ─────────────────────────────────────────────┐
+│  13:42:18  review_requests_added       REQ-3   "Token storage refactor"         │
+│  13:41:55  decisions_changed           DEC-7   Token storage                    │
+│  13:39:02  dev_tasks_changed           ACS-9g3 [dev:api] Add /v2/sessions       │
+└─────────────────────────────────────────────────────────────────────────────────┘
+ dcam tmux feed • 27 events buffered
+```
+
+Blockers render in reverse video so they're hard to miss; the agent
+tree groups review-requests under their owning slug; the events log
+streams from the same `dcam tmux watch` NDJSON the manager Claude
+consumes over SSH.
+
 ## Running Tests
 
 ```bash
@@ -604,6 +631,21 @@ dcam project init                           # Make memory committable
 dcam project install-hook                   # Auto-persist on commits
 dcam tmux start payment --launch
 dcam tmux dev payment api "Add /v2/sessions handler" --launch
+dcam tmux dev payment auth "Add OAuth refresh" --launch
+dcam tmux review payment --launch
+
+# Watch the team live (in a separate terminal — locally or over SSH):
+dcam tmux feed payment
+# Or, on your local Mac while workers run on a remote dev desk:
+dcam tmux feed --remote dev-desk:payment
+
+# When a dev hits something they can't proceed without, they file a blocker:
+dcam tmux ask api "Token storage: server vs cookie?" --severity blocker \
+  --options "server|cookie" --recommend server
+
+# The feed TUI highlights blockers in reverse video; CI can also gate on:
+dcam tmux escalations --exit-on-open
+
 # (See TMUX.md for the full multi-agent workflow.)
 ```
 
