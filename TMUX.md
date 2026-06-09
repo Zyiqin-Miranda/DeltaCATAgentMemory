@@ -580,6 +580,79 @@ Output covers:
 Useful for the manager at the top of each day instead of running
 `tmux capture-pane` against every dev window.
 
+## Severity: blockers vs. advisory
+
+By default a `dcam tmux ask` or `dcam tmux request-review` is **advisory**:
+the dev keeps working with their best guess (the Propulsion Principle),
+the reviewer/manager picks it up at their own pace, no one is stuck.
+
+When the dev genuinely *cannot* make progress without the answer, mark
+the request a **blocker**:
+
+```bash
+dcam tmux ask billing "Idempotency TTL" \
+    --options "1h|24h|7d" --recommend 24h \
+    --severity blocker --epic billing
+
+dcam tmux request-review billing \
+    --notes "Need to verify idempotency before merge" \
+    --severity blocker --tmux-session myproject
+```
+
+A blocker fires **four channels**:
+
+1. **Loud reviewer-pane notification.** The send-keys notification is
+   prefixed `[BLOCKER review-request]` and a third line is appended:
+   _"This is a BLOCKER request. Drain it BEFORE any other work or
+   background task."_
+2. **Top-of-digest.** `dcam tmux digest` prints a `!! BLOCKERS (N open)`
+   header at the very top of its output, with REQ-/DEC- ids and notes,
+   so the manager can't miss them in the scroll.
+3. **`escalations` view.** `dcam tmux escalations` is the focused
+   "what's blocked" report — review-requests and decisions both. With
+   `--exit-on-open` it returns exit code 2 when anything is open, so
+   you can wire it into a cron or pre-merge CI gate.
+4. **`feed` highlighting.** The control panel TUI (next section)
+   shows blockers in reverse video so they pop visually.
+
+```bash
+dcam tmux escalations               # Listing
+dcam tmux escalations --exit-on-open  # CI: exit 2 when anything is blocked
+```
+
+Use blocker sparingly. The whole pull-based model assumes that *most*
+dev work proceeds in parallel with manager/reviewer attention — if
+every ask is a blocker, you've reverted to a synchronous, single-thread
+workflow.
+
+## Control panel: `dcam tmux feed`
+
+A curses TUI for live multi-agent state. Three panes:
+
+- **Agent tree (top-left)** — one row per dev slug with their latest
+  `[status]` bd comment and any review-requests they own. Blocker
+  requests are reverse-video.
+- **Key context (top-right)** — open decisions (severity-marked),
+  active critical points, registered specs (with linked decisions), and
+  pending handoffs.
+- **Event log (bottom)** — rolling NDJSON deltas from `dcam tmux watch`,
+  newest at the top.
+
+```bash
+# Local: same host as the workers
+dcam tmux feed <session>
+
+# Remote (the recommended hybrid mode): runs `ssh dev-desk dcam ...
+# tmux watch <session>` under the hood and pipes its NDJSON into the
+# local renderer.
+dcam tmux feed --remote dev-desk:<session>
+```
+
+Keys: `q` quit, `j`/`k` scroll the events pane, `g` jump to top, `r`
+force redraw. The TUI re-spawns nothing if the watch process dies —
+the status bar shows the error and the last-known state stays visible
+so you can read it before quitting.
+
 ## Live event stream: `dcam tmux watch <session>`
 
 `digest` is a one-shot snapshot. For the hybrid (local manager +
@@ -1020,7 +1093,7 @@ The parquet rows are the source of truth.
 | `send <session> <window> "<text>"`                | mgr   | tmux send-keys to a window's pane                         |
 | `capture <session> <window> [--tail N]`           | mgr   | Capture a window's pane buffer                            |
 | `update <slug> "<msg>"`                           | dev   | Post a `[status]` comment on the dev's bd task            |
-| `ask <slug> "<title>" --context --options [--recommend --epic --op --ticket]` | dev   | Request a manager decision                          |
+| `ask <slug> "<title>" --context --options [--recommend --epic --op --ticket --severity blocker\|advisory]` | dev   | Request a manager decision (blocker = dev is stuck)            |
 | `decide --id N --choice K --rationale "..." [--epic --op --ticket --persist]`  | mgr   | Resolve an open decision                          |
 | `decide --supersedes N --choice K --rationale "..." [--persist]` | mgr   | Revise a prior decision (scope/ticket inherit unless overridden) |
 | `decisions list [--status open\|decided\|superseded\|withdrawn]` | any   | Browse decisions                                  |
@@ -1029,9 +1102,11 @@ The parquet rows are the source of truth.
 | `critical add "<text>" [--rationale --epic --op --ticket --persist]` | any | Record a forward-looking invariant                  |
 | `critical list [--status active\|retired]`        | any   | List critical points                                      |
 | `critical retire <id> [--reason --persist]`       | any   | Retire a critical point (kept in JSON for audit)          |
-| `digest [--recent-lessons N]`                     | any   | Standup snapshot: dev status, open decisions, lessons, CPs|
-| `watch <session> [--interval N --once]`           | mgr   | Long-running NDJSON event stream (snapshot + diffs)       |
-| `request-review <slug> [--notes --files --decisions --epic --op --ticket --tmux-session]` | dev | File a review request; live-notify the reviewer window  |
+| `digest [--recent-lessons N]`                     | any   | Standup snapshot: dev status, open decisions, lessons, CPs (top-of-output blockers section) |
+| `watch <session> [--interval N --once]`           | mgr   | Long-running NDJSON event stream (snapshot + diffs); events carry `severity` |
+| `escalations [--exit-on-open]`                    | any   | Focused list of open BLOCKER review-requests + decisions. Exit 2 when any open (for CI) |
+| `feed <session> [--remote host:session]`          | mgr   | Curses control panel: agent tree, key context, live events. Pipes from `watch` |
+| `request-review <slug> [--notes --files --decisions --epic --op --ticket --severity blocker\|advisory --tmux-session]` | dev | File a review request; live-notify the reviewer window (louder for blocker) |
 | `reviews pending`                                 | any   | List pending + claimed review requests                    |
 | `reviews show <id>`                               | any   | Show a request and its review (if completed)              |
 | `reviews claim <id> [--by]`                       | reviewer | Claim a request                                          |

@@ -70,6 +70,20 @@ class DecisionStatus(str, Enum):
     WITHDRAWN = "withdrawn"
 
 
+class Severity(str, Enum):
+    """Routing priority for review requests and decision asks.
+
+    BLOCKER: dev cannot make progress without this. Reviewer / manager
+        should drain it before any other work. Surfaces at the top of
+        `dcam tmux digest`, prefixed loudly in the reviewer-pane
+        notification, and listed by `dcam tmux escalations`.
+    ADVISORY (default): normal priority, picked up at the reviewer's
+        own pace.
+    """
+    BLOCKER = "blocker"
+    ADVISORY = "advisory"
+
+
 @dataclass
 class Decision:
     id: Optional[int] = None
@@ -88,6 +102,7 @@ class Decision:
     epic: Optional[str] = None          # epic slug, e.g. "native-read"
     op: Optional[str] = None            # operation, e.g. "CreateProvider"
     ticket: Optional[str] = None        # external ticket URL
+    severity: Severity = Severity.ADVISORY  # blocker = dev is stuck waiting
     persist_target: Optional[str] = None  # "claude" | "agents" | "both"
     persisted_at: Optional[datetime] = None
     created_at: datetime = field(default_factory=datetime.now)
@@ -164,6 +179,7 @@ class ReviewRequest:
     git_head: Optional[str] = None          # HEAD SHA at request time
     related_decision_ids: str = ""          # comma-sep DEC ids
     status: ReviewRequestStatus = ReviewRequestStatus.PENDING
+    severity: Severity = Severity.ADVISORY
     claimed_by: Optional[str] = None
     session_id: Optional[str] = None
     persist_target: Optional[str] = None

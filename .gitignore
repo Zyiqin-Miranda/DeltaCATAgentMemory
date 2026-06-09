@@ -8,3 +8,7 @@ build/
 # Dolt database files (added by bd init)
 .dolt/
 *.db
+
+# Claude Code local settings + hooks (machine-specific paths)
+.claude/
+CLAUDE.md

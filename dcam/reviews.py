@@ -24,7 +24,8 @@ from datetime import datetime
 from typing import List, Optional
 
 from dcam.models import (
-    Handoff, HandoffStatus, Review, ReviewRequest, ReviewRequestStatus, Spec,
+    Handoff, HandoffStatus, Review, ReviewRequest, ReviewRequestStatus,
+    Severity, Spec,
 )
 from dcam.store import DeltaStore
 
@@ -32,20 +33,20 @@ from dcam.store import DeltaStore
 # --- Notification (live tmux send-keys) ------------------------------------
 
 
-def _notify_reviewer_window(session: Optional[str], message: str):
+def _notify_reviewer_window(session: Optional[str], message: str,
+                            blocker: bool = False):
     """Best-effort live notification to the `review` window via tmux.
 
     Silent if tmux isn't running, the session doesn't exist, or the
     review window hasn't been spawned. The persistent review_request
     row is the durable channel — this is just the live ping.
 
-    Sends two lines:
-    1. The notification itself, NOT comment-prefixed, so the reviewer
-       Claude treats it as a real prompt and acts on it. (Pre-2026-05-28
-       we sent ``# <msg>`` which Claude treated as inert ambient text;
-       requests sat unprocessed for tens of minutes.)
-    2. An explicit "drain pending" instruction so the agent knows what
-       command to run.
+    For ADVISORY requests, sends two lines (notification + drain
+    instruction).
+
+    For BLOCKER requests, sends a third line escalating severity:
+    "This is a BLOCKER. Drain it before any other work." The reviewer
+    Claude treats it as the next prompt to handle.
     """
     if not session:
         return
@@ -55,11 +56,8 @@ def _notify_reviewer_window(session: Optional[str], message: str):
             return
         if "review" not in tmux_mod.list_windows(session):
             return
-        # Two-line prompt. The first line is the human-readable
-        # notification; the second is the explicit instruction the agent
-        # acts on. send_keys appends Enter by default, which submits.
-        tmux_mod.send_keys(session, "review",
-                           f"[review-request] {message}")
+        prefix = "[BLOCKER review-request]" if blocker else "[review-request]"
+        tmux_mod.send_keys(session, "review", f"{prefix} {message}")
         tmux_mod.send_keys(
             session, "review",
             "Drain pending review requests now: "
@@ -67,6 +65,12 @@ def _notify_reviewer_window(session: Optional[str], message: str):
             "`reviews claim <id>`, do the review, and "
             "`reviews complete <id> --summary \"...\" --persist claude`.",
         )
+        if blocker:
+            tmux_mod.send_keys(
+                session, "review",
+                "This is a BLOCKER request — the requesting dev is "
+                "stuck. Drain it BEFORE any other work or background task.",
+            )
     except Exception:
         # Any failure here should never break the request.
         pass
@@ -100,9 +104,16 @@ def request_review(store: DeltaStore, *, slug: str,
                    ticket: Optional[str] = None,
                    related_decision_ids: str = "",
                    session_id: Optional[str] = None,
+                   severity: Severity = Severity.ADVISORY,
                    project_path: Optional[str] = None,
                    tmux_session: Optional[str] = None) -> ReviewRequest:
-    """Dev requests a review. Persistent JSON row + live tmux notification."""
+    """Dev requests a review. Persistent JSON row + live tmux notification.
+
+    `severity=Severity.BLOCKER` triggers a louder notification and
+    surfaces this request at the top of `dcam tmux digest` until it's
+    drained. Use it sparingly: by definition, the dev is unable to
+    continue without the reviewer's input.
+    """
     req = ReviewRequest(
         slug=slug, notes=notes.strip(),
         scope_files=scope_files,
@@ -110,15 +121,19 @@ def request_review(store: DeltaStore, *, slug: str,
         git_head=_git_head(project_path) if project_path else None,
         related_decision_ids=related_decision_ids,
         session_id=session_id,
+        severity=severity,
     )
     req = store.append_review_request(req)
-    msg_parts = [f"[review-request] REQ-{req.id}", f"slug:{slug}"]
+    is_blocker = severity == Severity.BLOCKER
+    head = "[BLOCKER review-request]" if is_blocker else "[review-request]"
+    msg_parts = [f"{head} REQ-{req.id}", f"slug:{slug}"]
     if epic or op:
         scope_label = f"{epic or '?'}·{op or '?'}"
         msg_parts.append(f"scope:{scope_label}")
     if notes:
         msg_parts.append(f'"{notes[:80]}"')
-    _notify_reviewer_window(tmux_session, " ".join(msg_parts))
+    _notify_reviewer_window(tmux_session, " ".join(msg_parts),
+                            blocker=is_blocker)
     return req
 
 

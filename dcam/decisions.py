@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 from dcam.models import (CriticalPoint, CriticalPointStatus, Decision,
-                         DecisionStatus, Lesson, Spec)
+                         DecisionStatus, Lesson, Severity, Spec)
 from dcam.store import DeltaStore
 
 # --- Section markers --------------------------------------------------------
@@ -105,8 +105,20 @@ def request_decision(store: DeltaStore, *, slug: str, title: str,
                      session_id: Optional[str] = None,
                      epic: Optional[str] = None,
                      op: Optional[str] = None,
-                     ticket: Optional[str] = None) -> Decision:
-    """A dev requests a manager decision. Non-blocking — dev keeps working."""
+                     ticket: Optional[str] = None,
+                     severity: Severity = Severity.ADVISORY) -> Decision:
+    """A dev requests a manager decision.
+
+    Default severity is ADVISORY: the dev is *not* blocked and should
+    continue with their best guess (the Propulsion Principle). The
+    manager will surface the chosen option later and the dev
+    course-corrects then.
+
+    Use ``severity=Severity.BLOCKER`` only when the dev genuinely
+    cannot make progress without the answer. Blocker decisions are
+    surfaced at the top of ``dcam tmux digest`` and listed by
+    ``dcam tmux escalations``.
+    """
     d = Decision(
         title=title.strip(),
         context=context.strip(),
@@ -117,10 +129,12 @@ def request_decision(store: DeltaStore, *, slug: str, title: str,
         task_id=task_id,
         session_id=session_id,
         epic=epic, op=op, ticket=ticket,
+        severity=severity,
     )
     d = store.append_decision(d)
-    _bd_comment_safe(task_id, f"[ask:{d.id}] {title}: requesting manager input "
-                              f"(recommended={recommended or '?'})")
+    head = "[BLOCKER ask:" if severity == Severity.BLOCKER else "[ask:"
+    _bd_comment_safe(task_id, f"{head}{d.id}] {title}: requesting manager "
+                              f"input (recommended={recommended or '?'})")
     return d
 
 

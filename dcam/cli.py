@@ -603,21 +603,26 @@ def _find_dev_task(slug):
 
 def cmd_tmux_ask(args):
     from dcam import decisions
+    from dcam.models import Severity
     store = get_store(args.namespace, args.search_backend, args.catalog,
                       getattr(args, "branch", "main"), getattr(args, "root", None))
     store.init_tables()
     task_id = _find_dev_task(args.slug)
+    severity = Severity(args.severity)
     d = decisions.request_decision(
         store, slug=args.slug, title=args.title, context=args.context,
         options=args.options, recommended=args.recommend,
         task_id=task_id, session_id=args.session_id,
         epic=args.epic, op=args.op, ticket=args.ticket,
+        severity=severity,
     )
     scope = []
     if d.epic: scope.append(f"epic={d.epic}")
     if d.op: scope.append(f"op={d.op}")
     scope_str = f", {', '.join(scope)}" if scope else ""
-    print(f"✓ requested DEC-{d.id} (slug={args.slug}, status=open{scope_str})")
+    sev_str = f", severity={severity.value}" if severity == Severity.BLOCKER else ""
+    print(f"✓ requested DEC-{d.id} (slug={args.slug}, status=open"
+          f"{scope_str}{sev_str})")
     if task_id:
         print(f"  bd comment posted on {task_id}")
 
@@ -714,6 +719,7 @@ def _watch_snapshot(store):
             continue
         snap["review_requests"][f"REQ-{r.id}"] = {
             "slug": r.slug, "status": r.status.value,
+            "severity": r.severity.value,
             "epic": r.epic, "op": r.op,
             "notes": (r.notes or "")[:120],
             "created_at": r.created_at.isoformat(),
@@ -724,6 +730,7 @@ def _watch_snapshot(store):
             continue
         snap["decisions"][f"DEC-{d.id}"] = {
             "title": d.title, "status": d.status.value,
+            "severity": d.severity.value,
             "epic": d.epic, "op": d.op,
             "chosen": d.chosen,
             "requested_by": d.requested_by,
@@ -851,20 +858,25 @@ def cmd_tmux_watch(args):
 
 def cmd_tmux_request_review(args):
     from dcam import reviews
+    from dcam.models import Severity
     store = get_store(args.namespace, args.search_backend, args.catalog,
                       getattr(args, "branch", "main"), getattr(args, "root", None))
     store.init_tables()
     project_path = args.project or os.getcwd()
+    severity = Severity(args.severity)
     req = reviews.request_review(
         store, slug=args.slug, notes=args.notes or "",
         scope_files=args.files or "",
         epic=args.epic, op=args.op, ticket=args.ticket,
         related_decision_ids=args.decisions or "",
         session_id=args.session_id,
+        severity=severity,
         project_path=project_path,
         tmux_session=args.tmux_session,
     )
-    print(f"✓ requested REQ-{req.id} (slug={args.slug}, status=pending)")
+    sev_label = "BLOCKER" if severity == Severity.BLOCKER else "advisory"
+    print(f"✓ requested REQ-{req.id} (slug={args.slug}, status=pending, "
+          f"severity={sev_label})")
     if req.git_head:
         print(f"  HEAD: {req.git_head}")
     if args.tmux_session:
@@ -1232,6 +1244,77 @@ def cmd_tmux_critical_retire(args):
         print(f"  persisted to {args.persist}")
 
 
+def _open_blockers(store):
+    """Return (blocker_review_requests, blocker_decisions) for surfacing.
+
+    A "blocker" is anything tagged ``severity=blocker`` that's still
+    open/unresolved. Used by both `digest` and the standalone
+    `escalations` view.
+    """
+    from dcam.models import Severity
+    blocker_reqs = [r for r in store.read_review_requests()
+                    if r.severity == Severity.BLOCKER
+                    and r.status.value in ("pending", "claimed")]
+    blocker_decs = [d for d in store.read_decisions(status="open")
+                    if d.severity == Severity.BLOCKER]
+    return blocker_reqs, blocker_decs
+
+
+def cmd_tmux_feed(args):
+    """Run the curses control panel.
+
+    Subprocess-spawns `dcam tmux watch` (locally or via SSH if --remote
+    is set) and renders its NDJSON stream as a three-pane TUI.
+    """
+    from dcam import feed
+    try:
+        feed.run_feed(args.session, remote=args.remote, root=args.root,
+                      interval=args.interval)
+    except RuntimeError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_tmux_escalations(args):
+    """Show open blocker review-requests + decisions.
+
+    Companion to `dcam tmux digest`'s top-of-output blocker section.
+    Useful when a manager/reviewer wants the focused view without the
+    full standup. Exits non-zero if anything is open and ``--exit-on-open``
+    is set, so it can be wired into CI/cron.
+    """
+    store = get_store(args.namespace, args.search_backend, args.catalog,
+                      getattr(args, "branch", "main"), getattr(args, "root", None))
+    reqs, decs = _open_blockers(store)
+    if not reqs and not decs:
+        print("No open blockers.")
+        return
+    print(f"!! BLOCKERS ({len(reqs) + len(decs)} open)")
+    print("=" * 60)
+    if reqs:
+        print("\nReview requests:")
+        for r in sorted(reqs, key=lambda x: x.id or 0):
+            scope = []
+            if r.epic: scope.append(r.epic)
+            if r.op: scope.append(r.op)
+            scope_str = " · ".join(scope) or "(unscoped)"
+            age_min = (datetime.now() - r.created_at).total_seconds() / 60
+            print(f"  REQ-{r.id:>3}  {r.status.value:7}  slug:{r.slug or '-':<15}  "
+                  f"[{scope_str}]  ({int(age_min)}m old)  {r.notes[:60]}")
+    if decs:
+        print("\nDecisions:")
+        for d in sorted(decs, key=lambda x: x.id or 0):
+            scope = []
+            if d.epic: scope.append(d.epic)
+            if d.op: scope.append(d.op)
+            scope_str = " · ".join(scope) or "(unscoped)"
+            age_min = (datetime.now() - d.created_at).total_seconds() / 60
+            print(f"  DEC-{d.id:>3}  open     slug:{d.requested_by or '-':<15}  "
+                  f"[{scope_str}]  ({int(age_min)}m old)  {d.title[:60]}")
+    if args.exit_on_open and (reqs or decs):
+        sys.exit(2)
+
+
 def cmd_tmux_digest(args):
     """Aggregate per-dev status, open decisions, recent lessons, and critical
     points into a single 'standup' view."""
@@ -1239,6 +1322,17 @@ def cmd_tmux_digest(args):
     from dcam.orchestrator import list_tasks, _run_bd
     store = get_store(args.namespace, args.search_backend, args.catalog,
                       getattr(args, "branch", "main"), getattr(args, "root", None))
+
+    # Surface blockers at the top so they can't be missed in the scroll.
+    blocker_reqs, blocker_decs = _open_blockers(store)
+    if blocker_reqs or blocker_decs:
+        print(f"!! BLOCKERS ({len(blocker_reqs) + len(blocker_decs)} open) — "
+              f"see `dcam tmux escalations` for details")
+        for r in blocker_reqs:
+            print(f"   REQ-{r.id} (slug:{r.slug}): {r.notes[:80]}")
+        for d in blocker_decs:
+            print(f"   DEC-{d.id} (slug:{d.requested_by}): {d.title[:80]}")
+        print()
 
     print("DCAM digest")
     print("=" * 60)
@@ -1963,6 +2057,11 @@ def main():
                         help="Per-op scope, e.g. 'CreateProvider'")
     tx_ask.add_argument("--ticket", default=None,
                         help="External ticket URL (any tracker)")
+    tx_ask.add_argument("--severity", default="advisory",
+                        choices=["blocker", "advisory"],
+                        help="`blocker` = dev cannot proceed without the "
+                             "answer; surfaces atop digest + escalations "
+                             "(use sparingly). Default: advisory.")
 
     tx_dec = txsub.add_parser("decide", help="Manager resolves a decision")
     tx_dec.add_argument("--id", type=int, default=None,
@@ -2045,6 +2144,22 @@ def main():
     tx_watch.add_argument("--once", action="store_true",
                           help="Emit a single snapshot event and exit")
 
+    tx_esc = txsub.add_parser(
+        "escalations",
+        help="List open BLOCKER review-requests and decisions")
+    tx_esc.add_argument("--exit-on-open", action="store_true",
+                        help="Exit code 2 when any blocker is open (for CI)")
+
+    tx_feed = txsub.add_parser(
+        "feed",
+        help="Curses control panel: agent tree, key context, live events. "
+             "Reads from `dcam tmux watch` (locally or over SSH).")
+    tx_feed.add_argument("session", help="tmux session name")
+    tx_feed.add_argument("--remote", default=None,
+                         help="ssh-host[:session] — spawn watch over SSH")
+    tx_feed.add_argument("--interval", type=int, default=5,
+                         help="watch poll interval (default: 5)")
+
     # Review-request workflow
     tx_rreq = txsub.add_parser("request-review",
                                help="Dev asks the reviewer for feedback")
@@ -2058,6 +2173,12 @@ def main():
     tx_rreq.add_argument("--epic", default=None)
     tx_rreq.add_argument("--op", default=None)
     tx_rreq.add_argument("--ticket", default=None)
+    tx_rreq.add_argument("--severity", default="advisory",
+                         choices=["blocker", "advisory"],
+                         help="`blocker` = dev is stuck waiting for review; "
+                              "fires a louder pane notification, surfaces "
+                              "atop digest, listed by escalations. Default: "
+                              "advisory.")
     tx_rreq.add_argument("--session-id", default=None)
     tx_rreq.add_argument("--project", default=None)
     tx_rreq.add_argument("--tmux-session", default=None,
@@ -2229,6 +2350,8 @@ def main():
                 "msg": cmd_tmux_msg, "dep": cmd_tmux_dep, "deps": cmd_tmux_deps,
                 "digest": cmd_tmux_digest,
                 "watch": cmd_tmux_watch,
+                "escalations": cmd_tmux_escalations,
+                "feed": cmd_tmux_feed,
                 "request-review": cmd_tmux_request_review,
             }
             if args.tmux_cmd == "decisions":

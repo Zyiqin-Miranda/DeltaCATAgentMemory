@@ -18,7 +18,9 @@ AI chat sessions are ephemeral — when you close a chat, all context is lost. Y
 - **Decisions, lessons, and critical points** — first-class records for architectural decisions (with supersession audit trail), cross-session learnings, and forward-looking invariants, all rendered as managed sections of `CLAUDE.md`/`AGENTS.md`
 - **Multi-agent over tmux** — manager / dev / long-running reviewer workflow with pull-based review requests, structured handoffs, peer-to-peer messaging, decision asks, dep tracking, and a digest view ([TMUX.md](TMUX.md))
 - **Hybrid local-manager + remote-workers** — recommended architecture for cloud-desk users: manager runs on the local Mac, dev + reviewer run on the remote dev desk, communication via SSH + a long-running event stream ([TMUX.md § Architectures](TMUX.md#architectures-all-in-one-vs-hybrid))
-- **Live event stream** — `dcam tmux watch <session>` emits NDJSON snapshot + state-change deltas, designed for a local manager Claude to consume over SSH ([TMUX.md § Live event stream](TMUX.md#live-event-stream-dcam-tmux-watch-session))
+- **Live event stream** — `dcam tmux watch <session>` emits NDJSON snapshot + state-change deltas (events carry `severity`), designed for a local manager Claude to consume over SSH ([TMUX.md § Live event stream](TMUX.md#live-event-stream-dcam-tmux-watch-session))
+- **Severity & escalation** — `dcam tmux ask` and `request-review` accept `--severity blocker|advisory`; blockers fire a louder reviewer-pane notification, surface atop `dcam tmux digest`, and are listed by `dcam tmux escalations` (with `--exit-on-open` for CI)
+- **Control panel TUI** — `dcam tmux feed [--remote host:session]` is a curses dashboard with agent tree / key context / live event log, blockers in reverse video; pipes from the watch event stream so it works locally or over SSH
 - **Specs as versioned artifacts** — register markdown specs anywhere in the repo; DCAM tracks content hash + linked decisions and surfaces drift / NEEDS-UPDATE markers ([TMUX.md § Specs](TMUX.md#specs-as-versioned-artifacts))
 - **Auto-extract from transcripts** — `dcam claude extract` heuristically surfaces lesson/decision/critical-point candidates from a session, with interactive accept/reject promotion
 - **Project mode** — opt-in `<repo>/.dcam/` directory with JSON-as-primary storage so decisions, lessons, critical points, specs, handoffs, reviews, and session summaries are committed and reviewable in PRs alongside source code ([TMUX.md § Project mode](TMUX.md#project-mode-committing-memory-alongside-code))
@@ -378,6 +380,8 @@ dcam CLI / MCP Server
   │
   ├── dcam/reviews.py          → Pull-based review requests, completed-review records, handoffs
   │
+  ├── dcam/feed.py             → Curses control-panel TUI (consumes `dcam tmux watch` NDJSON)
+  │
   ├── dcam/extract.py          → Heuristic lesson/decision/critical extraction from transcripts
   │
   ├── dcam/decisions.py        → Decision/critical/specs/lessons lifecycle + managed-section render
@@ -503,8 +507,16 @@ dcam tmux reviews pending|claim <id>|complete <id> --summary "..."
 dcam tmux handoff create <from> <to> --files "..." --notes "..."
 dcam tmux digest
 
-# Live event stream (designed for a local manager consuming via SSH):
-dcam tmux watch <session>          # NDJSON snapshot + state-change deltas
+# Severity-routed escalation (blocker = dev is genuinely stuck):
+dcam tmux ask <slug> "<title>" --options "..." --severity blocker
+dcam tmux request-review <slug> --notes "..." --severity blocker
+dcam tmux escalations                  # focused list of open blockers
+dcam tmux escalations --exit-on-open   # exit 2 if any blocker open (CI gate)
+
+# Live event stream + control panel TUI:
+dcam tmux watch <session>              # NDJSON snapshot + state-change deltas
+dcam tmux feed <session>               # curses control panel reading from watch
+dcam tmux feed --remote dev-desk:<session>  # over SSH for hybrid architecture
 ```
 
 For the **hybrid local-manager + remote-workers** architecture
