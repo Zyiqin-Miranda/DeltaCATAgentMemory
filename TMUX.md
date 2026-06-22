@@ -377,6 +377,46 @@ remote box — it lives where you do.
 If you prefer the all-in-one pattern despite the trade-offs, the
 Quick Start below works as-is on a single host.
 
+### Foreground manager: the polling gap (Bug 20)
+
+A subtle limitation of the hybrid pattern: a Claude session running in
+your local Mac terminal is **foreground-only**. It runs during a user
+turn and is dormant between turns. It can't poll on its own schedule.
+
+If the dev posts a question while the manager session is dormant — say
+via `dcam tmux ask` or by typing in their pane — the manager won't
+notice until you (the human) message it next. On long stretches that
+gap can be 20+ minutes.
+
+DCAM ships a bridge daemon for this:
+
+```bash
+# In a separate Mac terminal (independent of the manager session):
+dcam manager-loop --remote dev-desk:<session> \
+    --out ~/.dcam/loop-<session>.ndjson
+```
+
+It subprocess-spawns `dcam tmux watch` (locally or via SSH) and tees
+the NDJSON event stream to the output file. Trimmed periodically to
+`--keep-lines` (default 5000).
+
+The foreground manager Claude then reads the tail of that file at the
+start of each user turn:
+
+```bash
+tail -n 50 ~/.dcam/loop-<session>.ndjson
+```
+
+You don't need to start a fresh `tail -f` per turn — just include the
+read as part of the manager's per-turn checklist. New event kinds
+since the last turn (e.g. `review_requests_added`,
+`dev_tasks_changed`) tell the manager what to act on.
+
+This isn't real-time polling, but it closes the foreground gap:
+between your message at T and your message at T+20m, the file
+accumulates every state change, and the manager catches up at T+20m
+in one read.
+
 ## Quick start (five commands)
 
 ```bash
@@ -908,6 +948,29 @@ dcam tmux msg auth api "your /v2/sessions response shape needs to include device
 
 `dep` wraps `bd dep add` so the orchestrator and `bd ready` honor it.
 
+### `dcam tmux msg` is also the manager→dev send path
+
+`dcam tmux msg` isn't peer-to-peer only. It's also the canonical
+**manager → dev** send path:
+
+```bash
+# Manager redirecting a dev mid-task:
+dcam tmux msg manager api "scope just changed: drop OAuth, use JWT instead"
+```
+
+Why prefer this over `dcam tmux send <session> <window> "..."`?
+
+- It runs the same code path as peer messages, so it survives bd
+  lookups and shows up under the dev's task comment thread.
+- Both the live notification (via tmux send-keys) AND a persisted bd
+  comment fire — the dev sees it now, and the manager has a paper
+  trail for `dcam tmux digest`.
+- It addresses by slug, not by raw `session:window` target, so window
+  renames or shell-escaping issues don't lose the message.
+
+Use `dcam tmux send` only for raw cases — typing into the manager's
+own pane, or addressing a non-dev window directly.
+
 ## Lessons learnt: cross-session knowledge
 
 Anything worth remembering across sessions — design principles you
@@ -982,6 +1045,23 @@ dcam tmux persist --target claude        # CLAUDE.md only
 dcam tmux persist --target agents        # AGENTS.md only
 dcam tmux persist --target both          # both files
 ```
+
+## When something stops working: `dcam doctor`
+
+Before chasing a specific error, run:
+
+```bash
+dcam doctor
+```
+
+It probes the moving parts (bd binary + Dolt server + tmux + claude
+CLI + `~/.claude/projects/` + `~/.claude.json` + dcam package + git
+repo + storage root) and prints one `OK`/`FAIL <reason>` row per
+probe. Exits 0 on full health, 1 otherwise. Safe to run anytime.
+
+The FAIL row tells you which subsystem to fix first — most of the bd
+recovery procedure below, for example, becomes "doctor says dolt
+circuit breaker is open; run the recovery steps below."
 
 ## Recovering from a corrupted bd database
 
@@ -1102,7 +1182,7 @@ The parquet rows are the source of truth.
 | `critical add "<text>" [--rationale --epic --op --ticket --persist]` | any | Record a forward-looking invariant                  |
 | `critical list [--status active\|retired]`        | any   | List critical points                                      |
 | `critical retire <id> [--reason --persist]`       | any   | Retire a critical point (kept in JSON for audit)          |
-| `digest [--recent-lessons N]`                     | any   | Standup snapshot: dev status, open decisions, lessons, CPs (top-of-output blockers section) |
+| `digest [--recent-lessons N --session NAME --pane-tail N]` | any   | Standup snapshot: dev status, open decisions, lessons, CPs (blockers atop). With `--session`, also reads live tmux panes — surfaces `--no-task` dispatches that wouldn't otherwise appear |
 | `watch <session> [--interval N --once]`           | mgr   | Long-running NDJSON event stream (snapshot + diffs); events carry `severity` |
 | `escalations [--exit-on-open]`                    | any   | Focused list of open BLOCKER review-requests + decisions. Exit 2 when any open (for CI) |
 | `feed <session> [--remote host:session]`          | mgr   | Curses control panel: agent tree, key context, live events. Pipes from `watch` |
@@ -1134,6 +1214,13 @@ And for project-mode storage management:
 | `project path`                                    | Print the active DCAM storage root                        |
 | `project install-hook [--repo PATH] [--force]`    | Symlink `.git/hooks/pre-commit` to auto-persist on commit |
 | `project uninstall-hook [--repo PATH]`            | Remove the symlink (no-op if it isn't ours)               |
+
+Top-level diagnostic + foreground-manager commands:
+
+| Command                                           | Purpose                                                   |
+|---------------------------------------------------|-----------------------------------------------------------|
+| `doctor`                                          | Run all probes (bd, dolt, tmux, claude, …) and print OK/FAIL per row. Exit 1 on any failure |
+| `manager-loop <session> [--remote host:session --out FILE --interval N --keep-lines N]` | Spawn `dcam tmux watch` (locally or via SSH) and tee NDJSON to a local file. The foreground manager Claude reads it at each user turn |
 
 Global flags (`--namespace`, `--catalog`, `--branch`, `--search-backend`,
 `--root`) work either before or after the subcommand.

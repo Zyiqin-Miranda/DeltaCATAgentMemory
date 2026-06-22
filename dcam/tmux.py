@@ -48,8 +48,15 @@ Your responsibilities:
   hand. Use `dcam tmux persist --target claude` to refresh.
 - Trigger code review with `dcam tmux review` when a dev's task is in flight
   or done. Read the reviewer's `[review]` comments via `bd show <task-id>`.
-- Use `dcam tmux send <session> <window> "<message>"` only for time-critical
-  interjections (corrections, scope changes). Prefer decisions and bd comments.
+- Send guidance / redirections / answers to a specific dev with
+  `dcam tmux msg manager <dev-slug> "<text>"`. This is the canonical
+  manager→dev send path: delivered live via tmux send-keys AND persisted
+  as a bd comment on the dev's task. Prefer this over `dcam tmux send`
+  (which is a raw send-keys wrapper); `msg` survives bd lookups and
+  shows up in `dcam tmux digest`.
+- Use `dcam tmux send <session> <window> "<message>"` only for raw
+  send-keys cases the `msg` path doesn't cover (e.g. typing into the
+  manager's own pane, or arbitrary text not addressed to a dev slug).
 
 You do NOT write production code yourself. You delegate.
 """
@@ -81,6 +88,11 @@ When your work depends on or affects another dev:
 - `dcam tmux msg {slug} <their-slug> "<text>"` — message them directly
   (delivered live via tmux + persisted as a bd comment on their task).
 - `dcam tmux deps {slug}` — see open dev tasks at a glance.
+
+**The manager talks to you the same way.** When the manager sends
+guidance, redirection, or answers to your `ask`, it arrives via
+`dcam tmux msg manager {slug} "<text>"` — visible in your pane as a
+fresh prompt. Watch for messages there before continuing each turn.
 
 When you discover something worth remembering across sessions:
 - `dcam tmux lesson "<one-line learning>" --category design|testing|ops`

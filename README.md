@@ -21,6 +21,8 @@ AI chat sessions are ephemeral — when you close a chat, all context is lost. Y
 - **Live event stream** — `dcam tmux watch <session>` emits NDJSON snapshot + state-change deltas (events carry `severity`), designed for a local manager Claude to consume over SSH ([TMUX.md § Live event stream](TMUX.md#live-event-stream-dcam-tmux-watch-session))
 - **Severity & escalation** — `dcam tmux ask` and `request-review` accept `--severity blocker|advisory`; blockers fire a louder reviewer-pane notification, surface atop `dcam tmux digest`, and are listed by `dcam tmux escalations` (with `--exit-on-open` for CI)
 - **Control panel TUI** — `dcam tmux feed [--remote host:session]` is a curses dashboard with agent tree / key context / live event log, blockers in reverse video; pipes from the watch event stream so it works locally or over SSH
+- **Foreground-manager bridge** — `dcam manager-loop --remote host:session [--out FILE]` tees `dcam tmux watch` to a local file so a foreground manager Claude on your Mac can read fresh events at each user turn (closes the "can't poll between turns" gap)
+- **`dcam doctor`** — first-step diagnostic: probes bd binary + dolt server + tmux + claude + `~/.claude/projects/` + `~/.claude.json` + project root; one OK/FAIL line per probe
 - **Specs as versioned artifacts** — register markdown specs anywhere in the repo; DCAM tracks content hash + linked decisions and surfaces drift / NEEDS-UPDATE markers ([TMUX.md § Specs](TMUX.md#specs-as-versioned-artifacts))
 - **Auto-extract from transcripts** — `dcam claude extract` heuristically surfaces lesson/decision/critical-point candidates from a session, with interactive accept/reject promotion
 - **Project mode** — opt-in `<repo>/.dcam/` directory with JSON-as-primary storage so decisions, lessons, critical points, specs, handoffs, reviews, and session summaries are committed and reviewable in PRs alongside source code ([TMUX.md § Project mode](TMUX.md#project-mode-committing-memory-alongside-code))
@@ -134,6 +136,7 @@ dcam project install-hook    # Symlink .git/hooks/pre-commit -> .dcam/hooks/pre-
 dcam status                  # Show sessions, memories, indexed files, beads status
 dcam project status          # Show active root, mode, and what is stored
 dcam serve                   # Start MCP server (for native tool integration)
+dcam doctor                  # First-step diagnostic: bd, dolt, tmux, claude probes
 ```
 
 ### Claude Code Integration
@@ -382,6 +385,10 @@ dcam CLI / MCP Server
   │
   ├── dcam/feed.py             → Curses control-panel TUI (consumes `dcam tmux watch` NDJSON)
   │
+  ├── dcam/doctor.py           → `dcam doctor` — bd/dolt/tmux/claude/python probes
+  │
+  ├── dcam/manager_loop.py     → `dcam manager-loop` — foreground-manager bridge (tees `tmux watch` to a file)
+  │
   ├── dcam/extract.py          → Heuristic lesson/decision/critical extraction from transcripts
   │
   ├── dcam/decisions.py        → Decision/critical/specs/lessons lifecycle + managed-section render
@@ -517,6 +524,14 @@ dcam tmux escalations --exit-on-open   # exit 2 if any blocker open (CI gate)
 dcam tmux watch <session>              # NDJSON snapshot + state-change deltas
 dcam tmux feed <session>               # curses control panel reading from watch
 dcam tmux feed --remote dev-desk:<session>  # over SSH for hybrid architecture
+
+# Foreground-manager bridge (manager Claude is on local Mac, can't tick
+# between user turns; this daemon tees events to a local file the manager
+# reads at the start of each turn):
+dcam manager-loop --remote dev-desk:<session> --out ~/.dcam/loop.ndjson
+
+# First-step diagnostic when something stops working:
+dcam doctor
 ```
 
 For the **hybrid local-manager + remote-workers** architecture

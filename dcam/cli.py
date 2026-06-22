@@ -337,6 +337,31 @@ def cmd_serve(args):
     run_server()
 
 
+def cmd_doctor(args):
+    from dcam.doctor import run_doctor
+    sys.exit(run_doctor())
+
+
+def cmd_manager_loop(args):
+    """Run the foreground-manager bridge loop.
+
+    Pairs with Bug 20: when the manager Claude is a foreground session
+    on the user's local Mac, it can't tick between user turns. This
+    daemon ticks for it — spawns `dcam tmux watch` (locally or over
+    SSH) and tees the NDJSON stream into a local file the foreground
+    manager reads at each turn.
+    """
+    from dcam.manager_loop import run_loop
+    sys.exit(run_loop(
+        args.session,
+        remote=args.remote,
+        root=getattr(args, "root", None),
+        interval=args.interval,
+        out_path=args.out,
+        keep_lines=args.keep_lines,
+    ))
+
+
 def cmd_branch_list(args):
     from dcam.branch_store import BranchStore
     bs = BranchStore(namespace=args.namespace, branch="main")
@@ -603,6 +628,7 @@ def _find_dev_task(slug):
 
 def cmd_tmux_ask(args):
     from dcam import decisions
+    from dcam.bridge import bd_available, bd_database_initialized
     from dcam.models import Severity
     store = get_store(args.namespace, args.search_backend, args.catalog,
                       getattr(args, "branch", "main"), getattr(args, "root", None))
@@ -625,6 +651,27 @@ def cmd_tmux_ask(args):
           f"{scope_str}{sev_str})")
     if task_id:
         print(f"  bd comment posted on {task_id}")
+    elif bd_available() and not bd_database_initialized():
+        # bd is on PATH but circuit-breaker / no-DB. The decision *did*
+        # land in JSON (so `dcam tmux decisions list` and `digest` will
+        # see it), but the side-channel `[ask:N]` bd comment never fired.
+        # Tell the dev loudly so they know to fall back to direct chat.
+        print(
+            f"  ⚠ bd unreachable; the [ask:{d.id}] comment did NOT post "
+            f"on the dev's bd task.\n"
+            f"    The decision IS recorded in .dcam/decisions.json — "
+            f"`dcam tmux digest` and `decisions list` will surface it.\n"
+            f"    If you need a faster channel, post a one-liner via "
+            f"`dcam tmux msg manager {args.slug} \"[needs-decision] DEC-"
+            f"{d.id}\"`.",
+            file=sys.stderr,
+        )
+    elif not bd_available():
+        print(
+            f"  ⚠ bd CLI not found; no bd comment posted. Decision still "
+            f"recorded in .dcam/decisions.json.",
+            file=sys.stderr,
+        )
 
 
 def cmd_tmux_decide(args):
@@ -1406,6 +1453,35 @@ def cmd_tmux_digest(args):
         for scope, n in sorted(grouped.items()):
             print(f"  {scope}: {n}")
 
+    # Live tmux panes — visible regardless of bd state. This catches the
+    # --no-task / bd-down case (Bug 17) where a dev is producing real
+    # output in a pane but has no bd-task to surface above.
+    if args.session and tmux_mod._tmux_available() \
+            and tmux_mod.session_exists(args.session):
+        windows = [w for w in tmux_mod.list_windows(args.session)
+                   if w.startswith("dev-") or w == "manager" or w == "review"]
+        if windows:
+            print(f"\nLive tmux panes ({args.session}):")
+            for w in windows:
+                tail = tmux_mod.capture_pane(args.session, w,
+                                             tail=args.pane_tail) or ""
+                # Show only the last few non-empty lines; the user can
+                # use `dcam tmux capture` for the full snapshot.
+                non_empty = [ln for ln in tail.splitlines()[-args.pane_tail:]
+                             if ln.strip()]
+                last = non_empty[-3:] if non_empty else ["(empty)"]
+                print(f"  [{w}]")
+                for ln in last:
+                    # Highlight tag prefixes the dev might post.
+                    tag = ""
+                    s = ln.strip()
+                    for marker in ("[checkpoint]", "[blocked]",
+                                   "[needs-decision]", "[ready-for-review]"):
+                        if marker in s:
+                            tag = "  ←"
+                            break
+                    print(f"    {s[:100]}{tag}")
+
 
 def cmd_tmux_persist(args):
     from dcam import decisions
@@ -1924,6 +2000,26 @@ def main():
     ft = sub.add_parser("fetch"); ft.add_argument("chunk_id", type=int)
     rv = sub.add_parser("resolve"); rv.add_argument("message")
     sub.add_parser("serve", help="Start DCAM MCP server")
+    sub.add_parser("doctor",
+                   help="Run a fixed set of probes (bd/dolt/tmux/claude/...) "
+                        "and report OK/FAIL per row. First-step diagnostic.")
+
+    ml = sub.add_parser(
+        "manager-loop",
+        help="Foreground-manager bridge: spawns `dcam tmux watch` (locally "
+             "or over SSH) and tees NDJSON to a local file the manager "
+             "reads at each user turn. Pairs with hybrid architecture.")
+    ml.add_argument("session", help="tmux session name (or, with --remote, "
+                                    "the remote-side session name)")
+    ml.add_argument("--remote", default=None,
+                    help="ssh-host[:remote-session-name] — spawn watch via SSH")
+    ml.add_argument("--interval", type=int, default=5,
+                    help="watch poll interval in seconds (default: 5)")
+    ml.add_argument("--out", default=None,
+                    help="output file path (default: "
+                         "~/.dcam/manager-loop-<session>.ndjson)")
+    ml.add_argument("--keep-lines", type=int, default=5000,
+                    help="periodically trim the loop file to this many lines")
 
     # branch subcommands
     br_p = sub.add_parser("branch", help="Branch management")
@@ -2132,6 +2228,13 @@ def main():
                                    "open decisions, recent lessons, critical points")
     tx_dig.add_argument("--recent-lessons", type=int, default=5,
                         help="How many recent lessons to surface (default: 5)")
+    tx_dig.add_argument("--session", default=None,
+                        help="If set, also include a Live tmux panes section "
+                             "walking this session's dev-*/manager/review "
+                             "windows (works even when bd is down).")
+    tx_dig.add_argument("--pane-tail", type=int, default=20,
+                        help="Lines of pane buffer to scan per window when "
+                             "--session is set (default: 20).")
 
     tx_watch = txsub.add_parser(
         "watch",
@@ -2308,7 +2411,8 @@ def main():
 
     cmds = {"init": cmd_init, "status": cmd_status, "compact": cmd_compact,
             "lookup": cmd_lookup, "fetch": cmd_fetch, "resolve": cmd_resolve,
-            "orchestrate": cmd_orchestrate, "serve": cmd_serve}
+            "orchestrate": cmd_orchestrate, "serve": cmd_serve,
+            "doctor": cmd_doctor, "manager-loop": cmd_manager_loop}
 
     if args.command == "chat":
         {"start": cmd_chat_start, "end": cmd_chat_end, "list": cmd_chat_list,
