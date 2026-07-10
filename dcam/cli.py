@@ -1724,12 +1724,78 @@ def cmd_claude_context(args):
     if not args.no_sync:
         project_path = args.project or os.getcwd()
         claude_code.sync_all_sessions(store, project_path)
+
+    # Proposal F: session-catchup nudge. If the most recent session
+    # racked up lots of tool calls but landed zero lessons, and there
+    # are pending extract candidates from the SessionEnd auto-mine
+    # (Proposal E), tell the operator to triage before they forget.
+    _emit_session_catchup_nudge(store)
+
     ctx = claude_code.get_recent_context(
         store, limit=args.sessions, max_messages_per_session=args.messages)
     if ctx:
         print(ctx)
     else:
         print("No previous session context available.")
+
+
+def _emit_session_catchup_nudge(store):
+    """Print a one-line 'you didn't persist anything last session' nudge
+    when the persistence gap looks real.
+
+    Prepended to `dcam claude context` output. Composes with the
+    SessionEnd auto-extract hook: E populates the candidate queue, F
+    ensures the queue gets looked at.
+    """
+    from dcam.project import load_config
+    cfg = load_config(store.storage_root)
+    threshold = int(cfg.get("nudge_threshold", 30))
+
+    sessions = store.read_sessions()
+    if not sessions:
+        return
+    # "Last session" = most recent by started_at, ignoring the currently-
+    # active session (heuristic: no ended_at means still open).
+    ended = [s for s in sessions if s.ended_at]
+    if not ended:
+        return
+
+    def _key(s):
+        ts = s.ended_at
+        if ts.tzinfo is not None:
+            ts = ts.replace(tzinfo=None)
+        return ts
+
+    last = max(ended, key=_key)
+
+    msg_count = last.message_count or 0
+    if msg_count < threshold:
+        return
+
+    lessons = [l for l in store.read_lessons()
+               if l.session_id == last.session_id]
+    if lessons:
+        return
+
+    # Count pending candidates from the extract buffer.
+    from dcam import extract as _extract
+    pending = [c for c in _extract.load_candidates(store.storage_root)
+               if c.get("status", "candidate") == "candidate"]
+    pending_from_last = sum(
+        1 for c in pending
+        if (c.get("source_session_id") or "")[:len(last.session_id or "")] == last.session_id
+    )
+    if not pending_from_last:
+        # No candidates to triage; nudge would be actionless.
+        return
+
+    print(
+        f"⚠ Last session ({last.session_id[:12]}): {msg_count} messages, "
+        f"0 lessons persisted. {pending_from_last} candidate(s) queued from "
+        f"the SessionEnd auto-extract.\n"
+        f"  Triage: `dcam claude extract-review --persist claude`",
+    )
+    print()
 
 
 def cmd_claude_extract(args):

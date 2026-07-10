@@ -929,6 +929,47 @@ Strong matches yield exactly the content after the prefix. Soft
 matches yield the containing sentence. The pass dedupes by
 `(kind, content)` so rerunning extract on the same session is a no-op.
 
+### Automatic mining on SessionEnd
+
+Since 2026-07-10, the Claude Code SessionEnd hook installed by
+`dcam claude init` runs `extract` automatically after each sync. So
+by the time a session's transcript is durable, its lesson /
+decision / critical candidates are already queued for review — no
+manual `dcam claude extract <session-id>` step required.
+
+At the start of your next session, `dcam claude context` prepends a
+one-line nudge when the last session had heavy activity but nothing
+persisted:
+
+```
+⚠ Last session (abc123def456): 82 messages, 0 lessons persisted.
+  6 candidate(s) queued from the SessionEnd auto-extract.
+  Triage: `dcam claude extract-review --persist claude`
+```
+
+The nudge suppresses itself once you record any lesson tagged with
+that session_id, so acting on it makes it go away.
+
+Both behaviors are configurable via `.dcam/config.json` (created on
+`dcam project init`, defaults inline if missing):
+
+```json
+{
+  "auto_extract": true,
+  "nudge_threshold": 30
+}
+```
+
+- `auto_extract: false` disables the SessionEnd extract phase.
+- `nudge_threshold: N` = require this many messages in the last
+  session before the nudge fires (default 30). Set higher on chatty
+  hosts where 30 messages is noise, lower on focused runs.
+
+Motivation is Proposal E+F in the bug report: in a real 4-day
+multi-agent run, 12 durable facts surfaced and only 3 got persisted.
+The auto-mine + nudge loop closes that gap without adding another
+CLI step to the operator's checklist.
+
 ## Peer-to-peer dev coordination
 
 When dev A's work depends on dev B's, the team should make it explicit

@@ -204,6 +204,42 @@ def discover_root(explicit_root: Optional[str] = None,
     return Path.home() / PROJECT_DIR_NAME
 
 
+# Defaults for `.dcam/config.json`. Keys the code reads:
+#   auto_extract         — SessionEnd hook auto-runs `dcam claude extract`.
+#                          Set to false to disable phrase-mining on sync.
+#   nudge_threshold      — messages in the last session needed to trigger
+#                          the F-proposal "you didn't persist anything"
+#                          nudge in `dcam claude context`.
+_DEFAULT_CONFIG = {
+    "auto_extract": True,
+    "nudge_threshold": 30,
+}
+
+
+def load_config(root: Optional[Path] = None) -> dict:
+    """Load `.dcam/config.json` (project-mode) if present, layered over defaults.
+
+    Never raises: a missing / malformed file yields defaults. Callers can
+    read config keys directly with .get() and rely on defaults.
+    """
+    import json as _json
+    if root is None:
+        root = discover_root(None)
+    cfg = dict(_DEFAULT_CONFIG)
+    path = Path(root) / "config.json"
+    if path.exists():
+        try:
+            file_cfg = _json.loads(path.read_text() or "{}")
+            if isinstance(file_cfg, dict):
+                cfg.update(file_cfg)
+        except _json.JSONDecodeError:
+            # Silent fallback to defaults — logging here would spam every
+            # CLI invocation; the doctor probe can flag the malformed
+            # file instead.
+            pass
+    return cfg
+
+
 def is_project_root(path: Path) -> bool:
     """A 'project root' is a `.dcam/` that lives anywhere except $HOME.
 

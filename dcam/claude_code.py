@@ -481,15 +481,38 @@ def install_claude_code_hook(project_path: str, namespace: str = "dcam",
     hook_path = hooks_dir / "dcam-session-sync.sh"
     hook_script = f'''#!/bin/bash
 # DCAM Claude Code SessionEnd hook
+#
+# Runs in two phases:
+#   1. `dcam claude sync` — persist the just-ended session's transcript
+#      to DCAM tables (as before).
+#   2. `dcam claude extract` — heuristically mine the transcript for
+#      lesson / decision / critical candidates and stash them in
+#      `extract_candidates.json` for the next `dcam claude extract-review`.
+#      Gated on `.dcam/config.json` -> auto_extract (default true).
+#      This is Proposal E from the bug report's memory-persistence
+#      proposals: the gap between "insight surfaced in a session" and
+#      "insight persisted as a lesson" was 9/12 in the observed 4-day
+#      run. Auto-mining shrinks that gap.
 set -e
 DCAM_NAMESPACE="{namespace}"
 DCAM_CATALOG="{catalog}"
 
 hook_input=$(cat)
 cwd=$(echo "$hook_input" | python3 -c "import json,sys; print(json.load(sys.stdin).get('cwd',''))" 2>/dev/null || echo "$(pwd)")
+session_id=$(echo "$hook_input" | python3 -c "import json,sys; print(json.load(sys.stdin).get('session_id',''))" 2>/dev/null || echo "")
 
 if command -v dcam &> /dev/null; then
     dcam claude sync --namespace "$DCAM_NAMESPACE" --catalog "$DCAM_CATALOG" --project "$cwd" 2>/dev/null || true
+
+    # Phase 2: mine transcript for candidates. Silent no-op if session_id
+    # is empty (older Claude Code versions) or if the user disabled
+    # auto_extract in `.dcam/config.json`.
+    if [[ -n "$session_id" ]]; then
+        auto_extract=$(python3 -c "from dcam.project import discover_root, load_config; print(load_config(discover_root(None)).get('auto_extract', True))" 2>/dev/null || echo "True")
+        if [[ "$auto_extract" == "True" ]]; then
+            dcam claude extract "$session_id" --namespace "$DCAM_NAMESPACE" --catalog "$DCAM_CATALOG" 2>/dev/null || true
+        fi
+    fi
 fi
 echo '{{"continue": true}}'
 exit 0
