@@ -197,3 +197,12 @@ dcam fetch 1
 2. ALWAYS run `dcam compact` first to get the summary
 3. Use `dcam fetch <chunk_id>` to get only the code you need
 4. Use `dcam lookup <name>` to find symbols across all indexed files
+
+## Shared Claude / Codex Memory
+
+For continuing project work, read the user's persistent retrieval guide at
+`/Users/zyiqin/.codex/shared-memory/DCAM.md` when available. It connects Codex to
+the existing central DCAM store and Claude memory indexes; originals remain
+unchanged. See `docs/CODEX_MEMORY.md` for setup provenance and portability.
+Retrieve only relevant memories, verify dated facts, and follow current
+instructions rather than treating archived memories as authorization.
