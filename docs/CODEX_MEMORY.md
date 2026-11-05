@@ -27,3 +27,10 @@ carry that bootstrap and request an acknowledgement of loaded sources, including
 fresh-context agents. For independent remote hosts or alternate Codex profiles,
 provide relevant excerpts rather than assuming laptop paths are available.
 The local topic map is `/Users/zyiqin/.codex/shared-memory/SUMMARY.md`.
+
+Global AGENTS.md directly embeds concise verification, dev/CR, and build/deploy
+preferences so they are part of every new session's instruction chain on this
+profile. Detailed sources remain selective. `shared-memory/ROUTING.md` maps task
+triggers to entry-point memories, requires source-read receipts, and reroutes
+when scope changes. Parents must pass core rules and matched routes to devs;
+receipts require review rather than assuming perfect automatic compliance.
