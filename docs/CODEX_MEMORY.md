@@ -20,3 +20,10 @@ directory, preserve originals, and create an equivalent global AGENTS.md entry
 point. Do not blindly copy absolute paths, account defaults, or credentials.
 Codex handoffs must be explicitly persisted to DCAM; Claude-specific hooks do
 not establish automatic Codex transcript persistence.
+
+The startup guide requires reading both memory indexes, listing central records,
+and retrieving relevant topic memories. Authorized dev assignments must explicitly
+carry that bootstrap and request an acknowledgement of loaded sources, including
+fresh-context agents. For independent remote hosts or alternate Codex profiles,
+provide relevant excerpts rather than assuming laptop paths are available.
+The local topic map is `/Users/zyiqin/.codex/shared-memory/SUMMARY.md`.

@@ -206,3 +206,8 @@ the existing central DCAM store and Claude memory indexes; originals remain
 unchanged. See `docs/CODEX_MEMORY.md` for setup provenance and portability.
 Retrieve only relevant memories, verify dated facts, and follow current
 instructions rather than treating archived memories as authorization.
+Complete the guide's startup bootstrap and identify the relevant sources loaded.
+For authorized delegated dev work, include memory-bootstrap instructions in
+every assignment and verify the dev's acknowledgement; inherited context alone
+is not evidence that the memory was read. Provide relevant excerpts when the
+agent cannot access the laptop's memory paths.
