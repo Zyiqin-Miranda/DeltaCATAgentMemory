@@ -418,28 +418,48 @@ def sync_all_sessions(store: DeltaStore,
 
 def get_recent_context(store: DeltaStore, limit: int = 3,
                        max_messages_per_session: int = 20,
-                       max_message_chars: int = 2000) -> str:
+                       max_message_chars: int = 2000,
+                       stale_after_days: int = 30, now=None) -> str:
     """Build context string from recent Claude Code sessions for injection.
 
     Returns a markdown-formatted summary of recent sessions that can be
     injected into CLAUDE.md or system prompt.
     """
-    def _sort_key(s):
-        ts = s.started_at
-        if ts.tzinfo is not None:
-            ts = ts.replace(tzinfo=None)
-        return ts
+    from dcam.memory import utc_timestamp
+    from datetime import timezone
+    if limit < 1 or max_messages_per_session < 0 or stale_after_days < 0:
+        raise ValueError("limit must be positive; messages and stale threshold nonnegative")
+    now = utc_timestamp(now or datetime.now(timezone.utc))
+    messages = {}
+    for msg in store.read_messages():
+        messages.setdefault(msg.session_id, []).append(msg)
+    for msgs in messages.values():
+        msgs.sort(key=lambda m: utc_timestamp(m.timestamp))
 
-    sessions = sorted(store.read_sessions(), key=_sort_key, reverse=True)
+    def activity(session):
+        timestamps = [session.started_at]
+        if session.ended_at:
+            timestamps.append(session.ended_at)
+        timestamps.extend(m.timestamp for m in messages.get(session.session_id, []))
+        return max(utc_timestamp(t) for t in timestamps)
+
+    sessions = sorted(store.read_sessions(), key=activity, reverse=True)
     if not sessions:
         return ""
 
-    lines = ["# Previous Session Context (from DeltaCAT)\n"]
+    lines = ["# Previous Session Context (historical, from selected DCAM store)",
+             "Verify current code, test, account and deployment state before acting.\n"]
 
     for session in sessions[:limit]:
         lines.append(f"## Session: {session.title or session.session_id}")
         lines.append(f"Date: {session.started_at.strftime('%Y-%m-%d %H:%M')}")
         lines.append(f"ID: {session.session_id}")
+        latest = activity(session)
+        age_days = max(0, (now - latest).days)
+        lines.append(f"Latest activity: {latest.isoformat()} · age={age_days}d")
+        lines.append("Source: stored session history (not the current agent session)")
+        if age_days >= stale_after_days:
+            lines.append(f"STALE: no recorded activity in {age_days} days; verify before reuse.")
         if session.summary:
             lines.append("")
             lines.append("### Summary")
@@ -447,8 +467,8 @@ def get_recent_context(store: DeltaStore, limit: int = 3,
                 lines.append(f"  {s_line}" if s_line else "")
         lines.append("")
 
-        msgs = store.read_messages(session.session_id)
-        recent_msgs = msgs[-max_messages_per_session:]
+        msgs = messages.get(session.session_id, [])
+        recent_msgs = msgs[-max_messages_per_session:] if max_messages_per_session else []
         for msg in recent_msgs:
             role_prefix = "User" if msg.role == MessageRole.USER else "Assistant"
             content = msg.content

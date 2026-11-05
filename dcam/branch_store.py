@@ -83,9 +83,8 @@ class BranchStore:
         self._ns_root = self.root / namespace
         self.meta = BranchMeta(self._ns_root)
 
-        # Auto-create branch if it doesn't exist
-        if branch != MAIN_BRANCH and not self.meta.exists(branch):
-            self.meta.create(branch)
+        # Reads (including validation) must not create a branch. First write
+        # creates it lazily below.
 
     def _branch_dir(self, branch: Optional[str] = None) -> Path:
         return self._ns_root / (branch or self.branch)
@@ -99,6 +98,8 @@ class BranchStore:
     # --- Write (always to current branch) ---
 
     def append_delta(self, table: str, data: pa.Table, partition: str = "__global__") -> int:
+        if self.branch != MAIN_BRANCH and not self.meta.exists(self.branch):
+            self.meta.create(self.branch)
         part_dir = self._partition_dir(table, partition)
         part_dir.mkdir(parents=True, exist_ok=True)
         existing = sorted(part_dir.glob("delta_*.parquet"))
@@ -123,7 +124,7 @@ class BranchStore:
         if branch_table:
             tables.append(branch_table)
 
-        return pa.concat_tables(tables) if tables else None
+        return pa.concat_tables(tables, promote_options="default") if tables else None
 
     def _read_partition_raw(self, table: str, partition: str,
                             branch: str) -> Optional[pa.Table]:
@@ -138,7 +139,7 @@ class BranchStore:
         for d in sorted(part_dir.glob("delta_*.parquet")):
             parts.append(pq.read_table(d))
 
-        return pa.concat_tables(parts) if parts else None
+        return pa.concat_tables(parts, promote_options="default") if parts else None
 
     def read_all(self, table: str) -> Optional[pa.Table]:
         """Read all partitions from main + branch."""
@@ -156,7 +157,7 @@ class BranchStore:
             if t and t.num_rows > 0:
                 tables.append(t)
 
-        return pa.concat_tables(tables) if tables else None
+        return pa.concat_tables(tables, promote_options="default") if tables else None
 
     def list_partitions(self, table: str) -> List[str]:
         partitions = set()

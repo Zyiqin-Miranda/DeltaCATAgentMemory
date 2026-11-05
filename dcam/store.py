@@ -2,7 +2,8 @@
 
 import json
 import uuid
-from datetime import datetime
+from contextlib import contextmanager
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 import pyarrow as pa
@@ -24,6 +25,8 @@ MEMORY_SCHEMA = pa.schema([
     ("created_at", pa.string()), ("updated_at", pa.string()),
     ("reinforcement_count", pa.int64()), ("source_session_id", pa.string()),
     ("active", pa.bool_()),
+    ("memory_uid", pa.string()), ("source", pa.string()),
+    ("supersedes_uid", pa.string()),
 ])
 
 MESSAGE_SCHEMA = pa.schema([
@@ -157,6 +160,7 @@ class DeltaStore:
         """
         from dcam.project import discover_root, is_project_root
         self.namespace = namespace
+        self.catalog_backend = catalog_backend
         self.branch = branch
         self._counters: Dict[str, int] = {}
         self.storage_root = discover_root(storage_root)
@@ -181,10 +185,10 @@ class DeltaStore:
                 )
         elif backend == "delta":
             from dcam.delta_catalog import DeltaNativeCatalog
-            return DeltaNativeCatalog()
+            return DeltaNativeCatalog(root=str(storage_root / "delta"))
         elif backend == "branch":
             from dcam.branch_catalog import BranchCatalog
-            return BranchCatalog(branch=branch)
+            return BranchCatalog(branch=branch, root=str(storage_root / "delta"))
         # `local` backend, the default. Switch implementation based on
         # whether we're in project mode (JSON-as-primary for committable
         # tables) or the historical global mode (parquet everything).
@@ -192,7 +196,7 @@ class DeltaStore:
             from dcam.json_catalog import JsonCatalog
             return JsonCatalog(storage_root)
         # Global mode: keep the historical layout at ~/.dcam/tables/.
-        return LocalCatalog()
+        return LocalCatalog(root=str(storage_root / "tables"))
 
     def _sync_counters(self):
         """Sync ID counters from existing table data to avoid collisions."""
@@ -205,7 +209,9 @@ class DeltaStore:
             try:
                 t = self._read_table(table)
                 if t and t.num_rows > 0:
-                    self._counters[table] = max(t.column(col).to_pylist()) + 1
+                    ids = [v for v in t.column(col).to_pylist() if v is not None]
+                    if ids:
+                        self._counters[table] = max(ids) + 1
             except Exception:
                 pass
 
@@ -244,19 +250,46 @@ class DeltaStore:
         if not t:
             return []
         mems = []
+        legacy_counts = {}
         for i in range(t.num_rows):
             r = {c: t.column(c)[i].as_py() for c in t.column_names}
+            # Legacy handles are stable across reads and same-record updates.
+            # Do not renumber old integer IDs or rewrite storage on a read.
+            legacy_key = json.dumps(
+                [r["id"], r["created_at"], r.get("name"), r["type"],
+                 r.get("source_session_id")], separators=(",", ":"))
+            uid = r.get("memory_uid")
+            if not uid:
+                uid = "mem-" + uuid.uuid5(
+                    uuid.NAMESPACE_URL, "dcam:memory:" + legacy_key).hex
+                # Flat/JSON stores are current state, not replay logs. Keep
+                # even identical legacy identities as distinct rows rather
+                # than silently conflating facts after an old ID collision.
+                if self.catalog_backend not in ("delta", "branch"):
+                    occurrence = legacy_counts.get(uid, 0)
+                    legacy_counts[uid] = occurrence + 1
+                    if occurrence:
+                        uid = "mem-" + uuid.uuid5(
+                            uuid.NAMESPACE_URL, f"dcam:{uid}:duplicate:{occurrence}").hex
             m = Memory(id=r["id"], type=MemoryType(r["type"]), name=r.get("name"),
                        category=r.get("category"),
                        topic=r.get("topic"), content=r["content"],
                        created_at=datetime.fromisoformat(r["created_at"]),
                        updated_at=datetime.fromisoformat(r["updated_at"]),
                        reinforcement_count=r.get("reinforcement_count", 1),
-                       source_session_id=r.get("source_session_id"), active=r.get("active", True))
+                       source_session_id=r.get("source_session_id"), active=r.get("active", True),
+                       memory_uid=uid, source=r.get("source"),
+                       supersedes_uid=r.get("supersedes_uid"))
             mems.append(m)
             if m.id and m.id >= self._counters.get("memories", 0):
-                self._counters["memories"] = m.id
-        return mems
+                self._counters["memories"] = m.id + 1
+        # Delta/branch catalogs can replay multiple versions of the same row.
+        # Last version wins, including inactive rows. Distinct legacy records
+        # with colliding integer IDs retain their own handles.
+        current = {}
+        for m in mems:
+            current[m.memory_uid] = m
+        return list(current.values())
 
     def write_memories(self, mems: List[Memory]):
         if not mems:
@@ -271,6 +304,9 @@ class DeltaStore:
             "reinforcement_count": [m.reinforcement_count for m in mems],
             "source_session_id": [m.source_session_id for m in mems],
             "active": [m.active for m in mems],
+            "memory_uid": [m.memory_uid for m in mems],
+            "source": [m.source for m in mems],
+            "supersedes_uid": [m.supersedes_uid for m in mems],
         }
         self._write_table("memories", pa.Table.from_pydict(data, schema=MEMORY_SCHEMA))
 
@@ -291,7 +327,7 @@ class DeltaStore:
                 continue
             msgs.append(msg)
             if msg.id and msg.id >= self._counters.get("chat_messages", 0):
-                self._counters["chat_messages"] = msg.id
+                self._counters["chat_messages"] = msg.id + 1
         return msgs
 
     def append_message(self, msg: ChatMessage):
@@ -357,7 +393,7 @@ class DeltaStore:
                 continue
             chunks.append(c)
             if c.chunk_id >= self._counters.get("compact_chunks", 0):
-                self._counters["compact_chunks"] = c.chunk_id
+                self._counters["compact_chunks"] = c.chunk_id + 1
         return chunks
 
     def write_chunks(self, chunks: List[FileChunk]):
@@ -384,14 +420,53 @@ class DeltaStore:
         results = self.search.search(query, docs, limit=limit)
         return [msgs[idx] for idx, _ in results]
 
-    def search_memories(self, query: str, limit: int = 1000) -> List[Memory]:
-        """Search active memories using the configured search backend."""
-        mems = [m for m in self.read_memories() if m.active]
-        docs = [(i, m.content) for i, m in enumerate(mems)]
+    def search_memories(self, query: str, limit: int = 1000,
+                        topic: Optional[str] = None,
+                        category: Optional[str] = None,
+                        project_only: bool = False) -> List[Memory]:
+        """Search content and metadata, optionally filtering project memories."""
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        if not query.strip():
+            return []
+        mems = [m for m in self.read_memories()
+                if m.active and (not project_only or m.type == MemoryType.PROJECT)
+                and (topic is None or m.topic == topic)
+                and (category is None or m.category == category)]
+        docs = [(i, "\n".join(v for v in
+                 (m.name, m.topic, m.category, m.source, m.content) if v))
+                for i, m in enumerate(mems)]
         results = self.search.search(query, docs, limit=limit)
         return [mems[idx] for idx, _ in results]
 
     # --- Project Memory (cross-session) ---
+
+    @contextmanager
+    def _memory_transaction(self):
+        """Serialize local read/modify/write memory additions across processes."""
+        if self.catalog_backend == "deltacat":
+            # This backend uses its own storage API, not a local lock file.
+            yield
+            return
+        import fcntl
+        directory = self.storage_root / ".locks"
+        directory.mkdir(parents=True, exist_ok=True)
+        key = uuid.uuid5(uuid.NAMESPACE_URL, self.namespace).hex
+        with (directory / f"memories-{key}.lock").open("a") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+    def add_memory(self, memory: Memory) -> Memory:
+        """Append an unnamed/type-specific memory using the shared write lock."""
+        with self._memory_transaction():
+            memories = self.read_memories()
+            memory.id = self._next_id("memories")
+            memories.append(memory)
+            self.write_memories(memories)
+        return memory
 
     def read_project_memories(self) -> List[Memory]:
         """Read memories that persist across all sessions."""
@@ -399,15 +474,46 @@ class DeltaStore:
 
     def add_project_memory(self, content: str, name: Optional[str] = None,
                            topic: Optional[str] = None,
-                           category: Optional[str] = None) -> Memory:
+                           category: Optional[str] = None,
+                           source: Optional[str] = None,
+                           supersedes: Optional[str] = None) -> Memory:
         """Add a cross-session project memory with an optional name for recall."""
+        with self._memory_transaction():
+            return self._add_project_memory(content, name, topic, category, source, supersedes)
+
+    def _add_project_memory(self, content, name, topic, category, source, supersedes):
         mems = self.read_memories()
+        previous = self.recall_memory(supersedes) if supersedes else None
+        if supersedes and previous is None:
+            raise ValueError(f"No memory matches supersedes reference '{supersedes}'")
         # If name exists, update instead of creating duplicate
         if name:
-            for m in mems:
+            matches = [m for m in mems if m.name == name and m.active]
+            if len(matches) > 1:
+                raise ValueError(f"Multiple memories named '{name}'; use distinct names")
+            for m in matches:
+                if previous and previous.memory_uid == m.memory_uid:
+                    raise ValueError("A memory cannot supersede itself; use a new name")
                 if m.name == name and m.active:
                     m.content = content
-                    m.updated_at = datetime.now()
+                    m.updated_at = datetime.now(timezone.utc)
+                    if topic is not None:
+                        m.topic = topic
+                    if category is not None:
+                        m.category = category
+                    if source is not None:
+                        m.source = source
+                    if previous:
+                        # Enforce an acyclic supersession chain.
+                        seen = {m.memory_uid}
+                        cursor = previous
+                        by_uid = {v.memory_uid: v for v in mems}
+                        while cursor:
+                            if cursor.memory_uid in seen:
+                                raise ValueError("Supersession would create a cycle")
+                            seen.add(cursor.memory_uid)
+                            cursor = by_uid.get(cursor.supersedes_uid)
+                        m.supersedes_uid = previous.memory_uid
                     m.reinforcement_count += 1
                     self.write_memories(mems)
                     return m
@@ -418,8 +524,10 @@ class DeltaStore:
             topic=topic,
             category=category,
             content=content,
-            created_at=datetime.now(),
-            updated_at=datetime.now(),
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+            source=source,
+            supersedes_uid=previous.memory_uid if previous else None,
         )
         mems.append(m)
         self.write_memories(mems)
@@ -427,25 +535,43 @@ class DeltaStore:
 
     def recall_by_name(self, name: str) -> Optional[Memory]:
         """Recall a named project memory."""
-        for m in self.read_memories():
-            if m.active and m.name == name:
-                return m
-        return None
+        matches = [m for m in self.read_memories() if m.active and m.name == name]
+        return self._unique_memory(matches, name)
+
+    @staticmethod
+    def _unique_memory(matches: List[Memory], reference: str) -> Optional[Memory]:
+        if len(matches) > 1:
+            handles = ", ".join(m.memory_uid for m in matches)
+            raise ValueError(f"Ambiguous memory '{reference}'; use a handle: {handles}")
+        return matches[0] if matches else None
+
+    def recall_memory(self, reference: str) -> Optional[Memory]:
+        """Recall by name, stable handle, or unambiguous legacy integer ID."""
+        mems = self.read_memories()
+        named = [m for m in mems if m.active and m.name == reference]
+        if named:
+            return self._unique_memory(named, reference)
+        matches = [m for m in mems if m.memory_uid == reference]
+        if not matches and reference.isdigit():
+            matches = [m for m in mems if m.id == int(reference)]
+        return self._unique_memory(matches, reference)
 
     def get_session_context(self, session_id: Optional[str] = None) -> str:
         """Build context string from project memories + session memories.
         
-        This is what gets injected into every new session automatically.
+        Integrations can request this for new sessions; storage alone does not
+        automatically load memory into every agent.
         """
+        from dcam.memory import render_memory
         lines = []
 
         # Always include project memories
         project_mems = self.read_project_memories()
         if project_mems:
             lines.append("## Project Memory (persists across sessions)\n")
+            all_mems = self.read_memories()
             for m in project_mems:
-                prefix = f"[{m.topic}] " if m.topic else ""
-                lines.append(f"- {prefix}{m.content}")
+                lines.append(render_memory(m, all_mems))
             lines.append("")
 
         # Include session-specific memories if session given
@@ -456,7 +582,7 @@ class DeltaStore:
             if session_mems:
                 lines.append("## Session Memory\n")
                 for m in session_mems:
-                    lines.append(f"- [{m.type.value}] {m.content}")
+                    lines.append(render_memory(m, self.read_memories()))
                 lines.append("")
 
         return "\n".join(lines)
@@ -496,7 +622,7 @@ class DeltaStore:
                 continue
             out.append(d)
             if d.id and d.id >= self._counters.get("decisions", 0):
-                self._counters["decisions"] = d.id
+                self._counters["decisions"] = d.id + 1
         return out
 
     def write_decisions(self, decisions: List[Decision]):
@@ -577,7 +703,7 @@ class DeltaStore:
             )
             out.append(ls)
             if ls.id and ls.id >= self._counters.get("lessons", 0):
-                self._counters["lessons"] = ls.id
+                self._counters["lessons"] = ls.id + 1
         return out
 
     def write_lessons(self, lessons: List[Lesson]):
@@ -642,7 +768,7 @@ class DeltaStore:
                 continue
             out.append(cp)
             if cp.id and cp.id >= self._counters.get("critical_points", 0):
-                self._counters["critical_points"] = cp.id
+                self._counters["critical_points"] = cp.id + 1
         return out
 
     def write_critical_points(self, points: List[CriticalPoint]):
@@ -715,7 +841,7 @@ class DeltaStore:
                 continue
             out.append(req)
             if req.id and req.id >= self._counters.get("review_requests", 0):
-                self._counters["review_requests"] = req.id
+                self._counters["review_requests"] = req.id + 1
         return out
 
     def write_review_requests(self, reqs: List[ReviewRequest]):
@@ -785,7 +911,7 @@ class DeltaStore:
             )
             out.append(rv)
             if rv.id and rv.id >= self._counters.get("reviews", 0):
-                self._counters["reviews"] = rv.id
+                self._counters["reviews"] = rv.id + 1
         return out
 
     def write_reviews(self, reviews: List[Review]):
@@ -845,7 +971,7 @@ class DeltaStore:
                 continue
             out.append(h)
             if h.id and h.id >= self._counters.get("handoffs", 0):
-                self._counters["handoffs"] = h.id
+                self._counters["handoffs"] = h.id + 1
         return out
 
     def write_handoffs(self, handoffs: List[Handoff]):
@@ -907,7 +1033,7 @@ class DeltaStore:
             )
             out.append(s)
             if s.id and s.id >= self._counters.get("specs", 0):
-                self._counters["specs"] = s.id
+                self._counters["specs"] = s.id + 1
         return out
 
     def write_specs(self, specs: List[Spec]):

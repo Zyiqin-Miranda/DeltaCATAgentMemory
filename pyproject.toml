@@ -12,7 +12,8 @@ requires-python = ">=3.9"
 # a C++ toolchain). Stay on the upstream LTS line.
 dependencies = [
     "pyarrow>=20.0",
-    "mcp>=1.0",
+    # Server uses the v1 FastMCP API; v2 removes that import.
+    "mcp>=1.0,<2",
 ]
 
 [project.optional-dependencies]

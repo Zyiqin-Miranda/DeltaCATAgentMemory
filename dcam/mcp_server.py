@@ -5,13 +5,14 @@ Configure in kiro: kiro-cli mcp add dcam -- dcam serve
 """
 
 from datetime import datetime
-from typing import Optional
+from typing import List, Optional
 
 from mcp.server.fastmcp import FastMCP
 
 from dcam import compact as compact_mod
 from dcam.models import ChatMessage, Memory, MemoryType, MessageRole
 from dcam.store import DeltaStore
+from dcam.memory import render_memory, validate_references
 
 mcp = FastMCP("dcam", instructions=(
     "DCAM provides persistent memory, chat history, and code indexing. "
@@ -27,49 +28,65 @@ _store = DeltaStore(namespace="dcam")
 
 @mcp.tool()
 def dcam_store_memory(content: str, type: str = "semantic",
-                      topic: Optional[str] = None, category: Optional[str] = None) -> str:
+                      topic: Optional[str] = None, category: Optional[str] = None,
+                      name: Optional[str] = None, source: Optional[str] = None,
+                      supersedes: Optional[str] = None) -> str:
     """Store a memory for long-term recall. Types: semantic, episodic, procedural, short_term, project.
     Use type='project' for facts that should persist across ALL sessions."""
-    mems = _store.read_memories()
+    if type == "project":
+        m = _store.add_project_memory(content, name=name, topic=topic, category=category,
+                                      source=source, supersedes=supersedes)
+        return f"Stored memory {m.memory_uid} (legacy ID {m.id}): {content[:80]}"
+    if supersedes:
+        raise ValueError("Supersession requires a project memory")
     m = Memory(
-        id=_store._next_id("memories"),
         type=MemoryType(type),
         topic=topic,
         category=category,
         content=content,
+        name=name,
+        source=source,
         created_at=datetime.now(),
         updated_at=datetime.now(),
     )
-    mems.append(m)
-    _store.write_memories(mems)
-    return f"Stored memory {m.id}: {content[:80]}"
+    _store.add_memory(m)
+    return f"Stored memory {m.memory_uid} (legacy ID {m.id}): {content[:80]}"
 
 
 @mcp.tool()
 def dcam_project_memory() -> str:
     """Get all project memories that persist across sessions.
-    These are automatically included in every new session's context."""
+    Included when the caller's integration requests project context."""
     ctx = _store.get_session_context()
     return ctx if ctx else "No project memories stored."
 
 
 @mcp.tool()
 def dcam_recall_memory(name: str) -> str:
-    """Recall a named project memory by its name handle."""
-    m = _store.recall_by_name(name)
+    """Recall by name or stable handle, with provenance and freshness warnings."""
+    m = _store.recall_memory(name)
     if m:
-        return f"[{m.name}] {m.content}"
-    return f"No memory named '{name}'"
+        return render_memory(m, _store.read_memories())
+    return f"No memory matching '{name}'"
 
 
 @mcp.tool()
-def dcam_search_memories(query: str, limit: int = 1000) -> str:
-    """Search memories by keyword using BM25 ranking."""
-    results = _store.search_memories(query, limit=limit)
+def dcam_search_memories(query: str, limit: int = 1000,
+                         topic: Optional[str] = None,
+                         category: Optional[str] = None) -> str:
+    """Search content, names and metadata with provenance/freshness warnings."""
+    results = _store.search_memories(query, limit=limit, topic=topic, category=category)
     if not results:
         return f"No memories matching '{query}'"
-    lines = [f"[{m.id}] [{m.type.value}] {m.content[:200]}" for m in results]
+    mems = _store.read_memories()
+    lines = [render_memory(m, mems, preview=200) for m in results]
     return "\n".join(lines)
+
+
+@mcp.tool()
+def dcam_validate_references(paths: List[str]) -> dict:
+    """Read-only typed-reference validation against this server's selected store."""
+    return validate_references(_store, paths)
 
 
 # --- Chat History Tools ---
@@ -116,7 +133,7 @@ def dcam_compact(file_path: str) -> str:
     try:
         n = compact_mod.compact_file(_store, file_path)
         chunks = _store.read_chunks(file_path)
-        lines = [f"{c.chunk_type.value:8} {c.name:30} L{c.start_line}-{c.end_line}  {c.summary[:80]}"
+        lines = [f"#{c.chunk_id} {c.chunk_type.value:8} {c.name:30} L{c.start_line}-{c.end_line}  {c.summary[:80]}"
                  for c in chunks]
         return f"Indexed {n} chunks:\n" + "\n".join(lines)
     except FileNotFoundError:
@@ -130,7 +147,7 @@ def dcam_lookup(symbol: str) -> str:
     chunks = compact_mod.lookup(_store, symbol)
     if not chunks:
         return f"No matches for '{symbol}'"
-    lines = [f"{c.chunk_type.value:8} {c.name:30} {c.file_path} L{c.start_line}-{c.end_line}"
+    lines = [f"#{c.chunk_id} {c.chunk_type.value:8} {c.name:30} {c.file_path} L{c.start_line}-{c.end_line}"
              for c in chunks]
     return "\n".join(lines)
 

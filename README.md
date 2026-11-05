@@ -172,7 +172,8 @@ launched agents don't block on first-run prompts.
 
 ### Project Memory (cross-session)
 
-Named memories that persist across all sessions. Automatically injected into every new session's context.
+Named memories that persist across sessions. Integrations must explicitly request
+memory context; storage alone does not automatically inject it into every agent.
 
 ```bash
 dcam memory add "Uses Java 17" --name java-stack              # Store with name
@@ -184,6 +185,46 @@ dcam memory list                                               # List all projec
 dcam memory context                                            # Show what gets injected
 dcam memory context --session-id SID                           # Project + session memories
 ```
+
+Search now covers names, topics, categories, source references and content:
+
+```bash
+dcam memory search "partition schema" --limit 10
+dcam memory search "migration" --topic allowlist --category workflow
+dcam memory search "timeout" --all-types --json
+dcam memory recall mem-<stable-handle> --json
+dcam memory recall java-stack --raw       # Backwards-compatible content-only output
+dcam memory add "New verified findings" --name audit-v2 --source evidence.md --supersedes audit-v1
+dcam --root /path/to/.dcam memory validate-refs MEMORY.md --strict
+```
+
+List, search, recall and context show identity, timestamps, provenance and
+supersession. `STALE` is an advisory warning after 30 days, not expiration;
+list/search/recall and Claude context accept `--stale-after-days`.
+Legacy naive timestamps are interpreted in the local timezone. Missing provenance
+is explicitly shown as unknown, not guessed. `--supersedes` retains the older
+record and marks it as superseded on retrieval.
+
+New records use stable `mem-...` handles. Existing records gain deterministic
+handles on read without renumbering old IDs or rewriting storage; normal subsequent
+writes persist those handles. Colliding legacy integer IDs are flagged and cannot
+be recalled ambiguously. Local CLI and MCP memory additions share a write lock
+on macOS/Linux; this does not make the entire catalog a distributed transaction
+system or coordinate older clients that bypass the addition API.
+
+`validate-refs` accepts files or recursively scanned Markdown directories.
+It checks `L-`, `CP-`, `DEC-`/`D-`, `H-`, `M-` and stable memory handles, including
+retired/superseded records. Reports include file/line and the selected root,
+namespace, catalog and branch. Missing records may belong to another store;
+the validator never invents replacements, scans remote stores, or edits sources.
+`--json` gives structured output; `--strict` exits 1 for missing/ambiguous
+references. Invalid paths or unreadable tables are errors, not "missing" findings.
+
+Markdown compaction uses ATX and Setext heading sections, ignores fenced-code
+headings, and retains preamble/front matter. `compact` and `lookup` now print chunk
+IDs directly for `fetch`. Reindex previously compacted Markdown files to get the
+new sections. Claude historical context sorts by latest recorded activity and
+clearly labels stale history; it is never evidence of current deployment/test state.
 
 Memory types:
 | Type | Scope | Example |

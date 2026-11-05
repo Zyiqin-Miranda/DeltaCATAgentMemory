@@ -29,6 +29,7 @@ from datetime import datetime
 from dcam import bridge, claude_code, compact, kiro, resolver
 from dcam.models import ChatMessage, ChatSession, Memory, MemoryType, MessageRole
 from dcam.store import DeltaStore
+from dcam.memory import memory_record, render_memory, store_record, validate_references
 def get_store(ns: str, backend: str = "bm25", catalog: str = "local",
               branch: str = "main", storage_root: str = None) -> DeltaStore:
     return DeltaStore(namespace=ns, search_backend=backend,
@@ -257,7 +258,7 @@ def cmd_compact(args):
         n = compact.compact_file(store, str(path))
         print(f"✓ {path}: {n} chunks")
         for c in store.read_chunks(str(path)):
-            print(f"    {c.chunk_type.value:8} {c.name:30} L{c.start_line}-{c.end_line}")
+            print(f"    #{c.chunk_id:<5} {c.chunk_type.value:8} {c.name:30} L{c.start_line}-{c.end_line}")
     else:
         print(f"Error: {path} not found", file=sys.stderr)
         sys.exit(1)
@@ -270,7 +271,7 @@ def cmd_lookup(args):
         print(f"No matches for '{args.symbol}'")
         return
     for c in chunks:
-        print(f"  {c.chunk_type.value:8} {c.name:30} {c.file_path} L{c.start_line}-{c.end_line}")
+        print(f"  #{c.chunk_id:<5} {c.chunk_type.value:8} {c.name:30} {c.file_path} L{c.start_line}-{c.end_line}")
         print(f"           {c.summary[:100]}")
 
 
@@ -297,30 +298,96 @@ def cmd_resolve(args):
 
 def cmd_memory_add(args):
     store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"), getattr(args, "root", None))
-    m = store.add_project_memory(args.content, name=args.name, topic=args.topic, category=args.category)
+    try:
+        m = store.add_project_memory(
+            args.content, name=args.name, topic=args.topic, category=args.category,
+            source=args.source, supersedes=args.supersedes)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(2)
     label = f" ({m.name})" if m.name else ""
-    print(f"Stored project memory {m.id}{label}: {m.content[:80]}")
+    print(f"Stored project memory {m.memory_uid}{label} (legacy ID {m.id}): {m.content[:80]}")
+
+
+def _print_memories(store, mems, args):
+    all_mems = store.read_memories()
+    if args.json:
+        print(json.dumps({
+            "store": store_record(store),
+            "memories": [memory_record(m, all_mems, args.stale_after_days) for m in mems],
+        }, indent=2))
+    else:
+        info = store_record(store)
+        print(f"Store: {info['root']} namespace={info['namespace']} "
+              f"catalog={info['catalog']} branch={info['branch'] or '-'}")
+        for m in mems:
+            print(render_memory(m, all_mems, args.stale_after_days, preview=100))
 
 
 def cmd_memory_list(args):
     store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"), getattr(args, "root", None))
     mems = store.read_project_memories()
-    if not mems:
+    if not mems and not args.json:
         print("No project memories stored.")
         return
-    for m in mems:
-        name = f"[{m.name}] " if m.name else ""
-        topic = f"({m.topic}) " if m.topic else ""
-        print(f"  {m.id:>4}  {name}{topic}{m.content[:100]}")
+    _print_memories(store, mems, args)
+
+
+def cmd_memory_search(args):
+    store = get_store(args.namespace, args.search_backend, args.catalog,
+                      getattr(args, "branch", "main"), getattr(args, "root", None))
+    mems = store.search_memories(args.query, limit=args.limit, topic=args.topic,
+                                category=args.category, project_only=not args.all_types)
+    if not mems and not args.json:
+        print(f"No memories matching '{args.query}'")
+        return
+    _print_memories(store, mems, args)
 
 
 def cmd_memory_recall(args):
     store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"), getattr(args, "root", None))
-    m = store.recall_by_name(args.name)
+    try:
+        m = store.recall_memory(args.name)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(2)
     if m:
-        print(m.content)
+        if args.raw:
+            print(m.content)
+        elif args.json:
+            print(json.dumps({
+                "store": store_record(store),
+                "memory": memory_record(m, store.read_memories(), args.stale_after_days),
+            }, indent=2))
+        else:
+            print(render_memory(m, store.read_memories(), args.stale_after_days))
     else:
-        print(f"No memory named '{args.name}'")
+        print(f"No memory matching '{args.name}'", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_memory_validate_refs(args):
+    store = get_store(args.namespace, args.search_backend, args.catalog,
+                      getattr(args, "branch", "main"), getattr(args, "root", None))
+    try:
+        report = validate_references(store, args.paths)
+    except (ValueError, OSError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(2)
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        info = report["store"]
+        print(f"Store: {info['root']} namespace={info['namespace']} "
+              f"catalog={info['catalog']} branch={info['branch'] or '-'}")
+        for row in report["references"]:
+            status = f" ({row['record_status']})" if row.get("record_status") else ""
+            print(f"{row['file']}:{row['line']} {row['reference']}: {row['result']}{status}")
+        print(f"{report['files_scanned']} files; {report['missing']} missing; "
+              f"{report['ambiguous']} ambiguous.")
+        print(report["note"])
+    if args.strict and (report["missing"] or report["ambiguous"]):
+        sys.exit(1)
 
 
 def cmd_memory_context(args):
@@ -333,8 +400,11 @@ def cmd_memory_context(args):
 
 
 def cmd_serve(args):
-    from dcam.mcp_server import run_server
-    run_server()
+    from dcam import mcp_server
+    mcp_server._store = get_store(
+        args.namespace, args.search_backend, args.catalog,
+        getattr(args, "branch", "main"), getattr(args, "root", None))
+    mcp_server.run_server()
 
 
 def cmd_doctor(args):
@@ -1732,7 +1802,8 @@ def cmd_claude_context(args):
     _emit_session_catchup_nudge(store)
 
     ctx = claude_code.get_recent_context(
-        store, limit=args.sessions, max_messages_per_session=args.messages)
+        store, limit=args.sessions, max_messages_per_session=args.messages,
+        stale_after_days=args.stale_after_days)
     if ctx:
         print(ctx)
     else:
@@ -2009,6 +2080,20 @@ def cmd_project_uninstall_hook(args):
         print("No DCAM-installed pre-commit hook found (nothing changed).")
 
 
+def _positive_int(value):
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return number
+
+
+def _nonnegative_int(value):
+    number = int(value)
+    if number < 0:
+        raise argparse.ArgumentTypeError("must be a nonnegative integer")
+    return number
+
+
 def main():
     p = argparse.ArgumentParser(prog="dcam", description="DeltaCAT Agent Memory")
     p.add_argument("--namespace", default="dcam")
@@ -2098,8 +2183,30 @@ def main():
     mem_p = sub.add_parser("memory", help="Project memory (cross-session)")
     msub = mem_p.add_subparsers(dest="mem_cmd")
     ma = msub.add_parser("add"); ma.add_argument("content"); ma.add_argument("--name", default=None); ma.add_argument("--topic", default=None); ma.add_argument("--category", default=None)
-    msub.add_parser("list")
-    mr = msub.add_parser("recall"); mr.add_argument("name")
+    ma.add_argument("--source", default=None, help="Evidence file, URL or other provenance")
+    ma.add_argument("--supersedes", default=None, help="Older memory name or stable handle")
+    ml = msub.add_parser("list")
+    ms = msub.add_parser("search", help="Search project memory content and metadata")
+    ms.add_argument("query")
+    ms.add_argument("--limit", type=_positive_int, default=20)
+    ms.add_argument("--topic", default=None, help="Exact topic filter")
+    ms.add_argument("--category", default=None, help="Exact category filter")
+    ms.add_argument("--all-types", action="store_true", help="Search all active memory types")
+    mr = msub.add_parser("recall", help="Recall by name, stable handle or unique legacy ID")
+    mr.add_argument("name", help="Name, mem-... handle, or unique integer ID")
+    recall_format = mr.add_mutually_exclusive_group()
+    recall_format.add_argument("--raw", action="store_true", help="Content only, without metadata")
+    for memory_parser in (ml, ms, mr):
+        if memory_parser is mr:
+            recall_format.add_argument("--json", action="store_true")
+        else:
+            memory_parser.add_argument("--json", action="store_true")
+        memory_parser.add_argument("--stale-after-days", type=_nonnegative_int, default=30,
+                                   help="Advisory age threshold (default: 30 days)")
+    mv = msub.add_parser("validate-refs", help="Read-only check of typed references in Markdown")
+    mv.add_argument("paths", nargs="+", help="Files or Markdown directories")
+    mv.add_argument("--json", action="store_true")
+    mv.add_argument("--strict", action="store_true", help="Exit 1 for missing or ambiguous references")
     mc = msub.add_parser("context"); mc.add_argument("--session-id", default=None)
 
     # claude code subcommands
@@ -2120,8 +2227,9 @@ def main():
     ccsr.add_argument("query"); ccsr.add_argument("--limit", type=int, default=10)
     ccctx = ccsub.add_parser("context", help="Get context from recent sessions")
     ccctx.add_argument("--project", default=None)
-    ccctx.add_argument("--sessions", type=int, default=3, help="Number of recent sessions")
-    ccctx.add_argument("--messages", type=int, default=20, help="Messages per session")
+    ccctx.add_argument("--sessions", type=_positive_int, default=3, help="Number of recent sessions")
+    ccctx.add_argument("--messages", type=_nonnegative_int, default=20, help="Messages per session")
+    ccctx.add_argument("--stale-after-days", type=_nonnegative_int, default=30)
     ccctx.add_argument("--no-sync", action="store_true", help="Skip sync before context")
 
     ccex = ccsub.add_parser("extract",
@@ -2490,6 +2598,7 @@ def main():
     elif args.command == "memory":
         {"add": cmd_memory_add, "list": cmd_memory_list,
          "recall": cmd_memory_recall,
+         "search": cmd_memory_search, "validate-refs": cmd_memory_validate_refs,
          "context": cmd_memory_context}.get(args.mem_cmd, lambda _: mem_p.print_help())(args)
     elif args.command == "claude":
         {"init": cmd_claude_init, "sync": cmd_claude_sync, "list": cmd_claude_list,

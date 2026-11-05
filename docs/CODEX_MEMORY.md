@@ -34,3 +34,9 @@ profile. Detailed sources remain selective. `shared-memory/ROUTING.md` maps task
 triggers to entry-point memories, requires source-read receipts, and reroutes
 when scope changes. Parents must pass core rules and matched routes to devs;
 receipts require review rather than assuming perfect automatic compliance.
+
+The DCAM UX update adds metadata-aware `memory search`, stable memory handles,
+timestamp/provenance/supersession display, and read-only `memory validate-refs`.
+Use the guide's explicit store selectors for these commands. Markdown indexes
+can now be re-compacted into heading sections with directly fetchable chunk IDs.
+Restart existing DCAM MCP server processes to load the updated code/tools.

@@ -40,7 +40,7 @@ def compact_file(store: DeltaStore, file_path: str) -> int:
         return 0
 
     lines = path.read_text(errors="replace").splitlines()
-    lang = LANG_MAP.get(path.suffix, "")
+    lang = LANG_MAP.get(path.suffix.lower(), "")
     pats = PATTERNS.get(lang, [])
 
     # Remove old chunks for this file
@@ -49,6 +49,14 @@ def compact_file(store: DeltaStore, file_path: str) -> int:
     # Parse chunks
     chunks = []
     cur_start = cur_name = cur_type = None
+
+    if lang == "markdown":
+        for start, end, name in _markdown_sections(lines, path.stem):
+            chunks.append(_make_chunk(
+                store, file_path, ChunkType.SECTION, name, start, end, lines))
+        existing.extend(chunks)
+        store.write_chunks(existing)
+        return len(chunks)
 
     for i, line in enumerate(lines, 1):
         stripped = line.strip()
@@ -73,11 +81,53 @@ def compact_file(store: DeltaStore, file_path: str) -> int:
     return len(chunks)
 
 
+def _markdown_sections(lines, stem):
+    """Non-overlapping heading sections; ignore headings inside fenced code."""
+    headings = []
+    fence = None
+    frontmatter = bool(lines and lines[0].strip() == "---")
+    for index, line in enumerate(lines):
+        if frontmatter:
+            if index > 0 and line.strip() in ("---", "..."):
+                frontmatter = False
+            continue
+        marker = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", line)
+        if fence:
+            if (marker and marker.group(1)[0] == fence[0]
+                    and len(marker.group(1)) >= fence[1]
+                    and not marker.group(2).strip()):
+                fence = None
+            continue
+        if marker:
+            if marker.group(1)[0] == "~" or "`" not in marker.group(2):
+                fence = (marker.group(1)[0], len(marker.group(1)))
+            continue
+        heading = re.match(r"^ {0,3}#{1,6}(?:[ \t]+(.+?)|[ \t]*)$", line)
+        if heading:
+            title = re.sub(r"[ \t]+#+[ \t]*$", "", heading.group(1) or "").strip()
+            headings.append((index + 1, title or "(untitled section)"))
+        elif (index > 0 and re.match(r"^ {0,3}(?:=+|-+)[ \t]*$", line)
+              and lines[index - 1].strip()
+              and not re.match(
+                  r"^(?: {4}|\t| {0,3}(?:#{1,6}(?:\s|$)|`{3,}|~{3,}|[-*+]\s|>\s|\d+\.\s))",
+                  lines[index - 1])
+              and (not headings or headings[-1][0] != index)):
+            headings.append((index, lines[index - 1].strip()))
+    if not lines:
+        return []
+    if not headings:
+        return [(1, len(lines), stem)]
+    if headings[0][0] > 1:
+        headings.insert(0, (1, stem + " (preamble)"))
+    return [(start, headings[i + 1][0] - 1 if i + 1 < len(headings) else len(lines), title)
+            for i, (start, title) in enumerate(headings)]
+
+
 def compact_directory(store: DeltaStore, dir_path: str) -> int:
     count = 0
     for root, _, files in os.walk(dir_path):
         for f in files:
-            if Path(f).suffix in LANG_MAP:
+            if Path(f).suffix.lower() in LANG_MAP:
                 try:
                     compact_file(store, os.path.join(root, f))
                     count += 1

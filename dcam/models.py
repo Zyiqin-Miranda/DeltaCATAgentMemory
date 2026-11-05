@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from typing import Optional
+from uuid import uuid4
 
 
 class MemoryType(str, Enum):
@@ -25,6 +26,7 @@ class ChunkType(str, Enum):
     CLASS = "class"
     IMPORT = "import"
     BLOCK = "block"
+    SECTION = "section"
 
 
 @dataclass
@@ -40,6 +42,9 @@ class Memory:
     reinforcement_count: int = 1
     source_session_id: Optional[str] = None
     active: bool = True
+    memory_uid: str = field(default_factory=lambda: "mem-" + uuid4().hex)
+    source: Optional[str] = None
+    supersedes_uid: Optional[str] = None
 
 
 @dataclass

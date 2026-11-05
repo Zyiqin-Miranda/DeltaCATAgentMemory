@@ -121,7 +121,7 @@ class DeltaNativeStore:
         for d in deltas:
             tables.append(pq.read_table(d))
 
-        return pa.concat_tables(tables) if tables else None
+        return pa.concat_tables(tables, promote_options="default") if tables else None
 
     def list_partitions(self, table: str) -> List[str]:
         """List all partitions for a table."""
@@ -143,7 +143,7 @@ class DeltaNativeStore:
             if t and t.num_rows > 0:
                 tables.append(t)
 
-        return pa.concat_tables(tables) if tables else None
+        return pa.concat_tables(tables, promote_options="default") if tables else None
 
     # --- Compaction ---
 
@@ -185,7 +185,7 @@ class DeltaNativeStore:
             if delta_path.exists():
                 tables.append(pq.read_table(delta_path))
 
-        return pa.concat_tables(tables) if tables else None
+        return pa.concat_tables(tables, promote_options="default") if tables else None
 
     def get_version(self, table: str) -> int:
         """Get current stream version for a table."""
