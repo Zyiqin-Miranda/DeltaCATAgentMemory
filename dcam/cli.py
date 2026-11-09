@@ -239,6 +239,18 @@ def cmd_chat_enter(args):
 
 
 def cmd_compact(args):
+    if args.read_only:
+        from pathlib import Path
+        path = Path(args.path)
+        if args.list or not path.is_file():
+            print("Error: --read-only requires one existing file", file=sys.stderr)
+            sys.exit(2)
+        chunks = compact.preview_file(str(path))
+        print(f"{path}: {len(chunks)} chunks (read-only; no catalog writes)")
+        for c in chunks:
+            print(f"  {c.chunk_type.value:8} {c.name:30} L{c.start_line}-{c.end_line}")
+        print("Fetch a range with: dcam fetch --file <path> --start-line N --end-line M")
+        return
     store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"), getattr(args, "root", None))
     if args.list:
         chunks = store.read_chunks()
@@ -276,6 +288,22 @@ def cmd_lookup(args):
 
 
 def cmd_fetch(args):
+    if args.file:
+        if args.chunk_id is not None or args.start_line is None or args.end_line is None:
+            print("Error: --file requires --start-line/--end-line and no chunk ID", file=sys.stderr)
+            sys.exit(2)
+        try:
+            from pathlib import Path
+            if not Path(args.file).is_file():
+                raise ValueError("File not found")
+            print(compact.fetch_lines(args.file, args.start_line, args.end_line))
+        except (ValueError, OSError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(2)
+        return
+    if args.chunk_id is None or args.start_line is not None or args.end_line is not None:
+        print("Error: supply a chunk ID or an explicit file/line range", file=sys.stderr)
+        sys.exit(2)
     store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"), getattr(args, "root", None))
     chunks = store.read_chunks()
     chunk = next((c for c in chunks if c.chunk_id == args.chunk_id), None)
@@ -301,12 +329,56 @@ def cmd_memory_add(args):
     try:
         m = store.add_project_memory(
             args.content, name=args.name, topic=args.topic, category=args.category,
-            source=args.source, supersedes=args.supersedes)
-    except ValueError as exc:
+            source=args.source, supersedes=args.supersedes,
+            keywords=args.keyword, scope=args.scope, summary=args.summary,
+            verified_at=args.verified_at, review_after=args.review_after)
+    except (ValueError, OSError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(2)
     label = f" ({m.name})" if m.name else ""
     print(f"Stored project memory {m.memory_uid}{label} (legacy ID {m.id}): {m.content[:80]}")
+
+
+def cmd_memory_update(args):
+    store = get_store(args.namespace, args.search_backend, args.catalog,
+                      getattr(args, "branch", "main"), getattr(args, "root", None))
+    try:
+        m = store.revise_memory(
+            args.reference, content=args.content, source=args.source, keywords=args.keyword,
+            scope=args.scope, summary=args.summary, verified_at=args.verified_at,
+            review_after=args.review_after, change_kind=args.kind, reason=args.reason)
+    except (ValueError, OSError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(2)
+    print(f"Updated {m.memory_uid} revision {m.revision}; prior content retained in history")
+
+
+def cmd_memory_index(args):
+    store = get_store(args.namespace, args.search_backend, args.catalog,
+                      getattr(args, "branch", "main"), getattr(args, "root", None))
+    try:
+        rows = store.memory_index(args.query, args.limit, args.topic, args.scope,
+                                  args.summary_chars, args.include_history)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(2)
+    if args.json:
+        print(json.dumps({"store": store_record(store), "memories": rows}, indent=2))
+    else:
+        for row in rows:
+            state = "needs recheck" if row["needs_reverification"] else "verified"
+            print(f"{row['memory_uid']} [{row['name'] or '-'}] {state}: {row['summary']}")
+
+
+def cmd_memory_history(args):
+    store = get_store(args.namespace, args.search_backend, args.catalog,
+                      getattr(args, "branch", "main"), getattr(args, "root", None))
+    try:
+        print(json.dumps({"store": store_record(store),
+                          **store.memory_history(args.reference)}, indent=2))
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(2)
 
 
 def _print_memories(store, mems, args):
@@ -337,7 +409,8 @@ def cmd_memory_search(args):
     store = get_store(args.namespace, args.search_backend, args.catalog,
                       getattr(args, "branch", "main"), getattr(args, "root", None))
     mems = store.search_memories(args.query, limit=args.limit, topic=args.topic,
-                                category=args.category, project_only=not args.all_types)
+                                category=args.category, project_only=not args.all_types,
+                                scope=args.scope, include_history=args.include_history)
     if not mems and not args.json:
         print(f"No memories matching '{args.query}'")
         return
@@ -392,7 +465,8 @@ def cmd_memory_validate_refs(args):
 
 def cmd_memory_context(args):
     store = get_store(args.namespace, args.search_backend, args.catalog, getattr(args, "branch", "main"), getattr(args, "root", None))
-    ctx = store.get_session_context(args.session_id)
+    ctx = store.get_session_context(args.session_id, query=args.query, limit=args.limit,
+                                    max_chars=args.max_chars, topic=args.topic, scope=args.scope)
     if ctx:
         print(ctx)
     else:
@@ -2147,8 +2221,12 @@ def main():
     enter = csub.add_parser("enter"); enter.add_argument("session_id")
 
     cp = sub.add_parser("compact"); cp.add_argument("path", nargs="?", default="."); cp.add_argument("--list", action="store_true")
+    cp.add_argument("--read-only", action="store_true", help="Summarize one file without a catalog/cache write")
     lk = sub.add_parser("lookup"); lk.add_argument("symbol")
-    ft = sub.add_parser("fetch"); ft.add_argument("chunk_id", type=int)
+    ft = sub.add_parser("fetch"); ft.add_argument("chunk_id", type=int, nargs="?")
+    ft.add_argument("--file", default=None)
+    ft.add_argument("--start-line", type=_positive_int, default=None)
+    ft.add_argument("--end-line", type=_positive_int, default=None)
     rv = sub.add_parser("resolve"); rv.add_argument("message")
     sub.add_parser("serve", help="Start DCAM MCP server")
     sub.add_parser("doctor",
@@ -2185,6 +2263,28 @@ def main():
     ma = msub.add_parser("add"); ma.add_argument("content"); ma.add_argument("--name", default=None); ma.add_argument("--topic", default=None); ma.add_argument("--category", default=None)
     ma.add_argument("--source", default=None, help="Evidence file, URL or other provenance")
     ma.add_argument("--supersedes", default=None, help="Older memory name or stable handle")
+    mu = msub.add_parser("update", help="Revise a named project memory without erasing history")
+    mu.add_argument("reference")
+    mu.add_argument("--content", default=None)
+    mu.add_argument("--source", default=None)
+    mu.add_argument("--kind", choices=["update", "correction", "state_transition"], default="update")
+    mu.add_argument("--reason", default=None)
+    for writer in (ma, mu):
+        writer.add_argument("--keyword", action="append", default=None, help="Keyword or alias; repeatable")
+        writer.add_argument("--scope", default=None)
+        writer.add_argument("--summary", default=None)
+        writer.add_argument("--verified-at", default=None, help="Evidence timestamp including timezone")
+        writer.add_argument("--review-after", default=None, help="Reverification deadline including timezone")
+    mi = msub.add_parser("index", help="Bounded keyword discovery metadata, without full memory bodies")
+    mi.add_argument("query", nargs="?", default=None)
+    mi.add_argument("--limit", type=_positive_int, default=10)
+    mi.add_argument("--summary-chars", type=_positive_int, default=160)
+    mi.add_argument("--topic", default=None)
+    mi.add_argument("--scope", default=None)
+    mi.add_argument("--include-history", action="store_true", help="Include superseded records")
+    mi.add_argument("--json", action="store_true")
+    mh = msub.add_parser("history", help="Show prior revisions and current evidence as JSON")
+    mh.add_argument("reference")
     ml = msub.add_parser("list")
     ms = msub.add_parser("search", help="Search project memory content and metadata")
     ms.add_argument("query")
@@ -2192,6 +2292,8 @@ def main():
     ms.add_argument("--topic", default=None, help="Exact topic filter")
     ms.add_argument("--category", default=None, help="Exact category filter")
     ms.add_argument("--all-types", action="store_true", help="Search all active memory types")
+    ms.add_argument("--scope", default=None)
+    ms.add_argument("--include-history", action="store_true", help="Include superseded records")
     mr = msub.add_parser("recall", help="Recall by name, stable handle or unique legacy ID")
     mr.add_argument("name", help="Name, mem-... handle, or unique integer ID")
     recall_format = mr.add_mutually_exclusive_group()
@@ -2208,6 +2310,11 @@ def main():
     mv.add_argument("--json", action="store_true")
     mv.add_argument("--strict", action="store_true", help="Exit 1 for missing or ambiguous references")
     mc = msub.add_parser("context"); mc.add_argument("--session-id", default=None)
+    mc.add_argument("--query", default=None, help="Select relevant current project memories")
+    mc.add_argument("--limit", type=_positive_int, default=10)
+    mc.add_argument("--max-chars", type=_positive_int, default=4000)
+    mc.add_argument("--topic", default=None)
+    mc.add_argument("--scope", default=None)
 
     # claude code subcommands
     cc_p = sub.add_parser("claude", help="Claude Code integration")
@@ -2597,6 +2704,7 @@ def main():
          "plan": cmd_task_plan}.get(args.task_cmd, lambda _: task_p.print_help())(args)
     elif args.command == "memory":
         {"add": cmd_memory_add, "list": cmd_memory_list,
+         "index": cmd_memory_index, "update": cmd_memory_update, "history": cmd_memory_history,
          "recall": cmd_memory_recall,
          "search": cmd_memory_search, "validate-refs": cmd_memory_validate_refs,
          "context": cmd_memory_context}.get(args.mem_cmd, lambda _: mem_p.print_help())(args)

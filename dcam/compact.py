@@ -81,6 +81,25 @@ def compact_file(store: DeltaStore, file_path: str) -> int:
     return len(chunks)
 
 
+def preview_file(file_path: str) -> List[FileChunk]:
+    """Parse without accessing a catalog or allocating persistent chunk IDs."""
+    class Preview:
+        chunks = None
+
+        def read_chunks(self):
+            return []
+
+        def write_chunks(self, chunks):
+            self.chunks = chunks
+
+        def _next_id(self, table):
+            return None
+
+    preview = Preview()
+    compact_file(preview, file_path)
+    return preview.chunks or []
+
+
 def _markdown_sections(lines, stem):
     """Non-overlapping heading sections; ignore headings inside fenced code."""
     headings = []
@@ -142,6 +161,8 @@ def lookup(store: DeltaStore, symbol: str) -> List[FileChunk]:
 
 
 def fetch_lines(file_path: str, start: int, end: int) -> str:
+    if start < 1 or end < start:
+        raise ValueError("Line range must satisfy 1 <= start <= end")
     p = Path(file_path)
     if not p.is_file():
         return ""

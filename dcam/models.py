@@ -3,7 +3,7 @@
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Optional
+from typing import List, Optional
 from uuid import uuid4
 
 
@@ -45,6 +45,14 @@ class Memory:
     memory_uid: str = field(default_factory=lambda: "mem-" + uuid4().hex)
     source: Optional[str] = None
     supersedes_uid: Optional[str] = None
+    keywords: List[str] = field(default_factory=list)
+    scope: Optional[str] = None
+    summary: Optional[str] = None
+    verified_at: Optional[datetime] = None
+    review_after: Optional[datetime] = None
+    verification_state: str = "unknown"
+    revision: int = 1
+    history: List[dict] = field(default_factory=list)
 
 
 @dataclass

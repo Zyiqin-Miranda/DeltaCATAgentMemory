@@ -15,6 +15,10 @@ def memory_record(memory, memories=(), stale_after_days=30, now=None):
     """Machine-readable identity, provenance and advisory freshness metadata."""
     now = now or datetime.now(timezone.utc)
     age = max(0, (utc_timestamp(now) - utc_timestamp(memory.updated_at)).days)
+    verified_age = (max(0, (utc_timestamp(now) - utc_timestamp(memory.verified_at)).days)
+                    if memory.verified_at else None)
+    overdue = bool(memory.review_after and utc_timestamp(now) >= utc_timestamp(memory.review_after))
+    stale = overdue or (verified_age if verified_age is not None else age) >= stale_after_days
     replacements = [m.memory_uid for m in memories
                     if m.active and m.supersedes_uid == memory.memory_uid]
     ids = Counter(m.id for m in memories)
@@ -29,7 +33,16 @@ def memory_record(memory, memories=(), stale_after_days=30, now=None):
         "created_at": memory.created_at.isoformat(),
         "updated_at": memory.updated_at.isoformat(),
         "age_days": age,
-        "stale": age >= stale_after_days,
+        "stale": stale,
+        "verified_at": memory.verified_at.isoformat() if memory.verified_at else None,
+        "verification_age_days": verified_age,
+        "review_after": memory.review_after.isoformat() if memory.review_after else None,
+        "verification_state": memory.verification_state,
+        "needs_reverification": stale or memory.verification_state != "verified",
+        "keywords": memory.keywords,
+        "scope": memory.scope,
+        "summary": memory.summary,
+        "revision": memory.revision,
         "active": memory.active,
         "source": memory.source,
         "source_session_id": memory.source_session_id,
@@ -48,7 +61,9 @@ def render_memory(memory, memories=(), stale_after_days=30, now=None, preview=No
     if r["legacy_id_ambiguous"]:
         flags.append("legacy ID ambiguous; use handle")
     if r["stale"]:
-        flags.append(f"STALE ({r['age_days']} days; verify current state)")
+        flags.append("STALE (review due; verify current state)")
+    if r["verification_state"] != "verified":
+        flags.append(f"verification={r['verification_state']}")
     if r["superseded_by"]:
         flags.append("SUPERSEDED BY " + ", ".join(r["superseded_by"]))
     source = memory.source or (
@@ -63,10 +78,55 @@ def render_memory(memory, memories=(), stale_after_days=30, now=None, preview=No
         lines.append(f"  topic={memory.topic or '-'} category={memory.category or '-'}")
     if memory.supersedes_uid:
         lines.append(f"  supersedes={memory.supersedes_uid}")
+    if memory.verified_at:
+        lines.append(f"  verified={r['verified_at']} revision={memory.revision}")
     if flags:
         lines.append("  " + "; ".join(flags))
     lines.append(text)
     return "\n".join(lines)
+
+
+def parse_evidence_time(value):
+    """Accept only explicit, timezone-aware evidence timestamps."""
+    if value is None:
+        return None
+    result = datetime.fromisoformat(value.replace("Z", "+00:00")) if isinstance(value, str) else value
+    if not isinstance(result, datetime) or result.tzinfo is None or result.utcoffset() is None:
+        raise ValueError("Evidence timestamps must include a timezone")
+    return result.astimezone(timezone.utc)
+
+
+def normalize_keywords(values):
+    if values is None:
+        return None
+    if isinstance(values, str):
+        raise ValueError("keywords must be a list of strings")
+    if any(not isinstance(v, str) or not v.strip() or len(v) > 256 for v in values):
+        raise ValueError("Each keyword must be a non-empty string of at most 256 characters")
+    result = list(dict.fromkeys(v.strip().casefold() for v in values))
+    if len(result) > 64:
+        raise ValueError("At most 64 keywords are supported")
+    return result
+
+
+def revision_snapshot(memory, changed_at, kind, reason):
+    """Capture the prior revision without recursively copying its history."""
+    record = memory_record(memory)
+    record.update(change_kind=kind, reason=reason, replaced_at=changed_at.isoformat())
+    return record
+
+
+def index_record(memory, memories, summary_chars=160):
+    """Bounded discovery metadata; never include full content or revision history."""
+    if not 1 <= summary_chars <= 4096:
+        raise ValueError("summary_chars must be between 1 and 4096")
+    record = memory_record(memory, memories)
+    fields = ("memory_uid", "name", "topic", "category", "scope", "keywords", "revision",
+              "verified_at", "review_after", "verification_state", "stale",
+              "needs_reverification", "superseded_by")
+    result = {key: record[key] for key in fields}
+    result["summary"] = " ".join((memory.summary or memory.content).split())[:summary_chars]
+    return result
 
 
 def store_record(store):

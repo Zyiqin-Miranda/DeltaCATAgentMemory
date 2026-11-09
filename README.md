@@ -175,6 +175,59 @@ launched agents don't block on first-run prompts.
 Named memories that persist across sessions. Integrations must explicitly request
 memory context; storage alone does not automatically inject it into every agent.
 
+Agents can start with a bounded keyword index instead of loading every memory:
+
+```bash
+dcam memory add "Verified build procedure" --name build-procedure \
+  --keyword build --keyword packaging --scope engineering \
+  --source evidence.md --verified-at 2026-11-01T12:00:00Z
+dcam memory index packaging --scope engineering --limit 5 --json
+dcam memory recall mem-<stable-handle>
+dcam memory context --query packaging --scope engineering --max-chars 4000
+```
+
+Index results include a short summary, keywords, identity and verification state,
+without full bodies or revision history. The index is generated from the selected
+store and does not write a separate cache. Exact names/keyword aliases rank above
+incidental body matches. Search and index omit superseded records by default;
+`--include-history` includes them. Exact recall still exposes an old record and
+its supersession warning. Legacy unfiltered `memory context` retains its existing
+behavior; use `--query` for bounded current context.
+
+Same-name updates retain the stable handle and snapshot the previous revision.
+Corrections require a reason, evidence source and timezone-aware verification time:
+
+```bash
+dcam memory update build-procedure --content "Corrected build procedure" \
+  --kind correction --reason "Reproduced behavior against the current source" \
+  --source new-evidence.md --verified-at 2026-11-09T12:00:00Z
+dcam memory history build-procedure
+```
+
+Use `--kind state_transition` for an ordinary change in state. History records
+the prior content, evidence and why it changed. Metadata edits do not refresh
+`verified_at`; changing content or its evidence source requires reverification
+unless a new verification time is supplied explicitly. Legacy records without
+verification metadata remain `unknown`. `--review-after` sets a recheck deadline.
+Freshness warnings use verification age when available, not the most recent edit.
+History starts with the first update made by this version; previously overwritten
+content cannot be recovered automatically. Older clients cannot preserve the new
+metadata/history: upgrade writers before using these features.
+
+The stdio MCP tools expose the same project-memory flow through
+`dcam_memory_index`, `dcam_update_memory`, `dcam_memory_history`, and the extended
+`dcam_store_memory` parameters. Restart existing MCP processes to load the tools.
+
+For source summaries when the shared catalog cannot be written:
+
+```bash
+dcam compact path/to/source.py --read-only
+dcam fetch --file path/to/source.py --start-line 12 --end-line 40
+```
+
+This mode returns explicit line ranges, allocates no persistent chunk IDs and
+opens no catalog. MCP equivalents are `dcam_preview_file` and `dcam_fetch_file`.
+
 ```bash
 dcam memory add "Uses Java 17" --name java-stack              # Store with name
 dcam memory add "Deploy: ./gradlew deploy" --name deploy-cmd  # Another named memory

@@ -27,6 +27,9 @@ MEMORY_SCHEMA = pa.schema([
     ("active", pa.bool_()),
     ("memory_uid", pa.string()), ("source", pa.string()),
     ("supersedes_uid", pa.string()),
+    ("keywords", pa.list_(pa.string())), ("scope", pa.string()),
+    ("summary", pa.string()), ("verified_at", pa.string()), ("review_after", pa.string()),
+    ("verification_state", pa.string()), ("revision", pa.int64()), ("history_json", pa.string()),
 ])
 
 MESSAGE_SCHEMA = pa.schema([
@@ -279,7 +282,13 @@ class DeltaStore:
                        reinforcement_count=r.get("reinforcement_count", 1),
                        source_session_id=r.get("source_session_id"), active=r.get("active", True),
                        memory_uid=uid, source=r.get("source"),
-                       supersedes_uid=r.get("supersedes_uid"))
+                        supersedes_uid=r.get("supersedes_uid"),
+                        keywords=r.get("keywords") or [], scope=r.get("scope"), summary=r.get("summary"),
+                        verified_at=datetime.fromisoformat(r["verified_at"]) if r.get("verified_at") else None,
+                        review_after=datetime.fromisoformat(r["review_after"]) if r.get("review_after") else None,
+                        verification_state=r.get("verification_state") or "unknown",
+                        revision=r.get("revision") or 1,
+                        history=json.loads(r.get("history_json") or "[]"))
             mems.append(m)
             if m.id and m.id >= self._counters.get("memories", 0):
                 self._counters["memories"] = m.id + 1
@@ -307,6 +316,13 @@ class DeltaStore:
             "memory_uid": [m.memory_uid for m in mems],
             "source": [m.source for m in mems],
             "supersedes_uid": [m.supersedes_uid for m in mems],
+            "keywords": [m.keywords for m in mems], "scope": [m.scope for m in mems],
+            "summary": [m.summary for m in mems],
+            "verified_at": [m.verified_at.isoformat() if m.verified_at else None for m in mems],
+            "review_after": [m.review_after.isoformat() if m.review_after else None for m in mems],
+            "verification_state": [m.verification_state for m in mems],
+            "revision": [m.revision for m in mems],
+            "history_json": [json.dumps(m.history) for m in mems],
         }
         self._write_table("memories", pa.Table.from_pydict(data, schema=MEMORY_SCHEMA))
 
@@ -423,21 +439,67 @@ class DeltaStore:
     def search_memories(self, query: str, limit: int = 1000,
                         topic: Optional[str] = None,
                         category: Optional[str] = None,
-                        project_only: bool = False) -> List[Memory]:
+                        project_only: bool = False, scope: Optional[str] = None,
+                        include_history: bool = False) -> List[Memory]:
         """Search content and metadata, optionally filtering project memories."""
         if limit < 1:
             raise ValueError("limit must be positive")
         if not query.strip():
             return []
-        mems = [m for m in self.read_memories()
+        all_mems = self.read_memories()
+        by_uid = {m.memory_uid: m for m in all_mems}
+        replaced = {m.supersedes_uid for m in all_mems if m.active and m.supersedes_uid}
+        mems = [m for m in all_mems
                 if m.active and (not project_only or m.type == MemoryType.PROJECT)
+                 and (include_history or m.memory_uid not in replaced)
                 and (topic is None or m.topic == topic)
-                and (category is None or m.category == category)]
+                 and (category is None or m.category == category)
+                 and (scope is None or m.scope == scope)]
+        aliases = [self._discovery_aliases(m, by_uid) for m in mems]
         docs = [(i, "\n".join(v for v in
-                 (m.name, m.topic, m.category, m.source, m.content) if v))
+                 (m.name, m.topic, m.category, m.scope, " ".join(aliases[i]),
+                  m.source, m.content) if v))
                 for i, m in enumerate(mems)]
-        results = self.search.search(query, docs, limit=limit)
-        return [mems[idx] for idx, _ in results]
+        results = self.search.search(query, docs, limit=max(len(docs), 1))
+        # Exact identifiers/aliases outrank incidental body matches.
+        results.sort(key=lambda item: (
+            query.strip().casefold() in [v.casefold() for v in aliases[item[0]]],
+            item[1]), reverse=True)
+        return [mems[idx] for idx, _ in results[:limit]]
+
+    @staticmethod
+    def _discovery_aliases(memory, by_uid):
+        """Old names/keywords still discover their current replacement."""
+        aliases, seen = [], set()
+        cursor = memory
+        while cursor and cursor.memory_uid not in seen:
+            seen.add(cursor.memory_uid)
+            aliases.extend(cursor.keywords)
+            if cursor.name:
+                aliases.append(cursor.name)
+            cursor = by_uid.get(cursor.supersedes_uid)
+        return list(dict.fromkeys(aliases))
+
+    def memory_index(self, query=None, limit=10, topic=None, scope=None,
+                     summary_chars=160, include_history=False):
+        from dcam.memory import index_record
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        if not 1 <= summary_chars <= 4096:
+            raise ValueError("summary_chars must be between 1 and 4096")
+        all_mems = self.read_memories()
+        if query is not None:
+            selected = self.search_memories(query, limit, topic=topic, scope=scope,
+                                           project_only=True, include_history=include_history)
+        else:
+            replaced = {m.supersedes_uid for m in all_mems if m.active}
+            selected = [m for m in all_mems if m.active and m.type == MemoryType.PROJECT
+                        and (include_history or m.memory_uid not in replaced)
+                        and (topic is None or m.topic == topic)
+                        and (scope is None or m.scope == scope)]
+            selected.sort(key=lambda m: m.updated_at.astimezone(timezone.utc), reverse=True)
+            selected = selected[:limit]
+        return [index_record(m, all_mems, summary_chars) for m in selected]
 
     # --- Project Memory (cross-session) ---
 
@@ -476,12 +538,29 @@ class DeltaStore:
                            topic: Optional[str] = None,
                            category: Optional[str] = None,
                            source: Optional[str] = None,
-                           supersedes: Optional[str] = None) -> Memory:
+                           supersedes: Optional[str] = None, keywords=None, scope=None,
+                           summary=None, verified_at=None, review_after=None,
+                           change_kind="update", reason=None) -> Memory:
         """Add a cross-session project memory with an optional name for recall."""
         with self._memory_transaction():
-            return self._add_project_memory(content, name, topic, category, source, supersedes)
+            return self._add_project_memory(content, name, topic, category, source, supersedes,
+                                            keywords, scope, summary, verified_at, review_after,
+                                            change_kind, reason)
 
-    def _add_project_memory(self, content, name, topic, category, source, supersedes):
+    def _add_project_memory(self, content, name, topic, category, source, supersedes,
+                            keywords=None, scope=None, summary=None, verified_at=None,
+                            review_after=None, change_kind="update", reason=None):
+        from dcam.memory import normalize_keywords, parse_evidence_time, revision_snapshot
+        keywords = normalize_keywords(keywords)
+        verified_at = parse_evidence_time(verified_at)
+        review_after = parse_evidence_time(review_after)
+        now = datetime.now(timezone.utc)
+        if verified_at and verified_at > now:
+            raise ValueError("verified_at cannot be in the future")
+        if change_kind not in ("update", "correction", "state_transition"):
+            raise ValueError("Unknown change_kind")
+        if change_kind == "correction" and (not reason or not source or not verified_at):
+            raise ValueError("A correction requires reason, source, and verified_at")
         mems = self.read_memories()
         previous = self.recall_memory(supersedes) if supersedes else None
         if supersedes and previous is None:
@@ -495,14 +574,27 @@ class DeltaStore:
                 if previous and previous.memory_uid == m.memory_uid:
                     raise ValueError("A memory cannot supersede itself; use a new name")
                 if m.name == name and m.active:
+                    if verified_at and not (source or m.source):
+                        raise ValueError("Verification requires an evidence source")
+                    m.history.append(revision_snapshot(m, now, change_kind, reason))
+                    m.revision += 1
+                    evidence_changed = content != m.content or (source is not None and source != m.source)
                     m.content = content
-                    m.updated_at = datetime.now(timezone.utc)
+                    m.updated_at = now
+                    if evidence_changed and m.verified_at:
+                        m.verification_state = "needs_reverification"
                     if topic is not None:
                         m.topic = topic
                     if category is not None:
                         m.category = category
                     if source is not None:
                         m.source = source
+                    for field, value in (("keywords", keywords), ("scope", scope), ("summary", summary),
+                                         ("verified_at", verified_at), ("review_after", review_after)):
+                        if value is not None:
+                            setattr(m, field, value)
+                    if verified_at:
+                        m.verification_state = "verified"
                     if previous:
                         # Enforce an acyclic supersession chain.
                         seen = {m.memory_uid}
@@ -517,6 +609,10 @@ class DeltaStore:
                     m.reinforcement_count += 1
                     self.write_memories(mems)
                     return m
+        if change_kind != "update":
+            raise ValueError("Correction/state transition requires an existing memory")
+        if verified_at and not source:
+            raise ValueError("Verification requires an evidence source")
         m = Memory(
             id=self._next_id("memories"),
             type=MemoryType.PROJECT,
@@ -528,10 +624,32 @@ class DeltaStore:
             updated_at=datetime.now(timezone.utc),
             source=source,
             supersedes_uid=previous.memory_uid if previous else None,
+            keywords=keywords or [], scope=scope, summary=summary,
+            verified_at=verified_at, review_after=review_after,
+            verification_state="verified" if verified_at else "unknown",
         )
         mems.append(m)
         self.write_memories(mems)
         return m
+
+    def revise_memory(self, reference, content=None, **metadata):
+        """Revise an existing project record under the same local write lock."""
+        with self._memory_transaction():
+            memory = self.recall_memory(reference)
+            if memory is None or memory.type != MemoryType.PROJECT or not memory.name or not memory.active:
+                raise ValueError("Revision requires an active named project memory")
+            return self._add_project_memory(
+                memory.content if content is None else content, memory.name,
+                metadata.pop("topic", None), metadata.pop("category", None),
+                metadata.pop("source", None), metadata.pop("supersedes", None), **metadata)
+
+    def memory_history(self, reference):
+        from dcam.memory import memory_record
+        memory = self.recall_memory(reference)
+        if memory is None:
+            raise ValueError(f"No memory matches '{reference}'")
+        return {"memory_uid": memory.memory_uid, "history": memory.history,
+                "current": memory_record(memory, self.read_memories())}
 
     def recall_by_name(self, name: str) -> Optional[Memory]:
         """Recall a named project memory."""
@@ -556,13 +674,25 @@ class DeltaStore:
             matches = [m for m in mems if m.id == int(reference)]
         return self._unique_memory(matches, reference)
 
-    def get_session_context(self, session_id: Optional[str] = None) -> str:
+    def get_session_context(self, session_id: Optional[str] = None, query=None,
+                            limit=10, max_chars=4000, topic=None, scope=None) -> str:
         """Build context string from project memories + session memories.
         
         Integrations can request this for new sessions; storage alone does not
         automatically load memory into every agent.
         """
         from dcam.memory import render_memory
+        if query is not None:
+            if max_chars < 1:
+                raise ValueError("max_chars must be positive")
+            all_mems = self.read_memories()
+            selected = self.search_memories(query, limit, topic=topic, scope=scope, project_only=True)
+            blocks = [render_memory(m, all_mems) for m in selected]
+            text = "\n\n".join(blocks)
+            marker = "\n[Context truncated; recall selected handles for full evidence.]"
+            if len(text) > max_chars:
+                return (text[:max(0, max_chars - len(marker))] + marker)[:max_chars]
+            return text
         lines = []
 
         # Always include project memories

@@ -19,6 +19,8 @@ mcp = FastMCP("dcam", instructions=(
     "Use dcam_compact before reading large files — it returns summaries. "
     "Use dcam_fetch to get only the specific chunk you need to edit. "
     "Use dcam_lookup to find symbols across all indexed files."
+    " Start lightweight: use dcam_memory_index with task keywords and scope, "
+    "then recall selected handles. Recheck stale or unverified evidence."
 ))
 
 _store = DeltaStore(namespace="dcam")
@@ -30,15 +32,21 @@ _store = DeltaStore(namespace="dcam")
 def dcam_store_memory(content: str, type: str = "semantic",
                       topic: Optional[str] = None, category: Optional[str] = None,
                       name: Optional[str] = None, source: Optional[str] = None,
-                      supersedes: Optional[str] = None) -> str:
+                      supersedes: Optional[str] = None, keywords: Optional[List[str]] = None,
+                      scope: Optional[str] = None, summary: Optional[str] = None,
+                      verified_at: Optional[str] = None, review_after: Optional[str] = None) -> str:
     """Store a memory for long-term recall. Types: semantic, episodic, procedural, short_term, project.
     Use type='project' for facts that should persist across ALL sessions."""
     if type == "project":
         m = _store.add_project_memory(content, name=name, topic=topic, category=category,
-                                      source=source, supersedes=supersedes)
+                                      source=source, supersedes=supersedes, keywords=keywords,
+                                      scope=scope, summary=summary, verified_at=verified_at,
+                                      review_after=review_after)
         return f"Stored memory {m.memory_uid} (legacy ID {m.id}): {content[:80]}"
     if supersedes:
         raise ValueError("Supersession requires a project memory")
+    if any(v is not None for v in (keywords, scope, summary, verified_at, review_after)):
+        raise ValueError("Evidence/index metadata currently requires a project memory")
     m = Memory(
         type=MemoryType(type),
         topic=topic,
@@ -54,10 +62,54 @@ def dcam_store_memory(content: str, type: str = "semantic",
 
 
 @mcp.tool()
-def dcam_project_memory() -> str:
+def dcam_memory_index(query: Optional[str] = None, limit: int = 10,
+                      topic: Optional[str] = None, scope: Optional[str] = None,
+                      summary_chars: int = 160, include_history: bool = False) -> dict:
+    """Start with bounded keywords/summaries, then recall selected evidence handles."""
+    return {"memories": _store.memory_index(query, limit, topic, scope,
+                                            summary_chars, include_history)}
+
+
+@mcp.tool()
+def dcam_update_memory(reference: str, content: Optional[str] = None,
+                       source: Optional[str] = None, keywords: Optional[List[str]] = None,
+                       scope: Optional[str] = None, summary: Optional[str] = None,
+                       verified_at: Optional[str] = None, review_after: Optional[str] = None,
+                       change_kind: str = "update", reason: Optional[str] = None) -> str:
+    """Preserve prior revisions. Corrections require reason, source and verified_at."""
+    m = _store.revise_memory(reference, content=content, source=source, keywords=keywords,
+                             scope=scope, summary=summary, verified_at=verified_at,
+                             review_after=review_after, change_kind=change_kind, reason=reason)
+    return f"Updated {m.memory_uid} revision {m.revision}; history retained"
+
+
+@mcp.tool()
+def dcam_memory_history(reference: str) -> dict:
+    """Read prior revisions, correction reasons and current evidence."""
+    return _store.memory_history(reference)
+
+
+@mcp.tool()
+def dcam_preview_file(file_path: str) -> dict:
+    """Summarize one local file without catalog writes; returns explicit line ranges."""
+    return {"file_path": file_path, "chunks": [
+        {"name": c.name, "start_line": c.start_line, "end_line": c.end_line,
+         "summary": c.summary} for c in compact_mod.preview_file(file_path)]}
+
+
+@mcp.tool()
+def dcam_fetch_file(file_path: str, start_line: int, end_line: int) -> str:
+    """Read an explicit local file range without persistent chunk IDs or writes."""
+    return compact_mod.fetch_lines(file_path, start_line, end_line)
+
+
+@mcp.tool()
+def dcam_project_memory(query: Optional[str] = None, limit: int = 10, max_chars: int = 4000,
+                        topic: Optional[str] = None, scope: Optional[str] = None) -> str:
     """Get all project memories that persist across sessions.
     Included when the caller's integration requests project context."""
-    ctx = _store.get_session_context()
+    ctx = _store.get_session_context(query=query, limit=limit, max_chars=max_chars,
+                                     topic=topic, scope=scope)
     return ctx if ctx else "No project memories stored."
 
 
@@ -73,9 +125,11 @@ def dcam_recall_memory(name: str) -> str:
 @mcp.tool()
 def dcam_search_memories(query: str, limit: int = 1000,
                          topic: Optional[str] = None,
-                         category: Optional[str] = None) -> str:
+                         category: Optional[str] = None, scope: Optional[str] = None,
+                         include_history: bool = False) -> str:
     """Search content, names and metadata with provenance/freshness warnings."""
-    results = _store.search_memories(query, limit=limit, topic=topic, category=category)
+    results = _store.search_memories(query, limit=limit, topic=topic, category=category,
+                                    scope=scope, include_history=include_history)
     if not results:
         return f"No memories matching '{query}'"
     mems = _store.read_memories()
