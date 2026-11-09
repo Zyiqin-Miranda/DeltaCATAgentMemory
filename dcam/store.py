@@ -556,36 +556,27 @@ class DeltaStore:
             matches = [m for m in mems if m.id == int(reference)]
         return self._unique_memory(matches, reference)
 
-    def get_session_context(self, session_id: Optional[str] = None) -> str:
-        """Build context string from project memories + session memories.
-        
-        Integrations can request this for new sessions; storage alone does not
-        automatically load memory into every agent.
-        """
+    def get_session_context(self, session_id: Optional[str] = None,
+                            limit=10, max_chars=4000) -> str:
+        """Return bounded context for one session, never the whole archive."""
         from dcam.memory import render_memory
-        lines = []
-
-        # Always include project memories
-        project_mems = self.read_project_memories()
-        if project_mems:
-            lines.append("## Project Memory (persists across sessions)\n")
-            all_mems = self.read_memories()
-            for m in project_mems:
-                lines.append(render_memory(m, all_mems))
-            lines.append("")
-
-        # Include session-specific memories if session given
-        if session_id:
-            session_mems = [m for m in self.read_memories()
-                           if m.active and m.source_session_id == session_id
-                           and m.type != MemoryType.PROJECT]
-            if session_mems:
-                lines.append("## Session Memory\n")
-                for m in session_mems:
-                    lines.append(render_memory(m, self.read_memories()))
-                lines.append("")
-
-        return "\n".join(lines)
+        if limit < 1 or max_chars < 1:
+            raise ValueError("limit and max_chars must be positive")
+        if not session_id:
+            return ""
+        all_mems = self.read_memories()
+        replaced = {m.supersedes_uid for m in all_mems if m.active}
+        selected = [m for m in all_mems
+                    if m.active and m.source_session_id == session_id
+                    and m.memory_uid not in replaced]
+        selected.sort(key=lambda m: (m.updated_at.replace(tzinfo=timezone.utc)
+                                    if m.updated_at.tzinfo is None else m.updated_at),
+                      reverse=True)
+        text = "\n\n".join(render_memory(m, all_mems) for m in selected[:limit])
+        marker = "\n[Context truncated; recall selected handles for full evidence.]"
+        if len(text) > max_chars:
+            return (text[:max(0, max_chars - len(marker))] + marker)[:max_chars]
+        return text
 
     # --- Decisions ---
 

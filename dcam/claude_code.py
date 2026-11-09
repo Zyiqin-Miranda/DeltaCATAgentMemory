@@ -571,16 +571,23 @@ exit 0
 This project uses DCAM for persistent session memory across Claude Code sessions.
 All conversations are automatically synced to DeltaCAT tables on session end.
 
-At the START of each new session, load previous context by running:
+At the START of a new task, confirm the project store and retrieve only matching
+task memory. Load universal preferences, then selected project/task records;
+do not load recent conversations or the whole project archive by default.
+Use `docs/MEMORY_SCOPING.md` when available. Check CLI help before scoped metadata
+retrieval on older installations.
+
 ```bash
-dcam claude context --namespace {namespace} --catalog {catalog}
+dcam project path --namespace {namespace} --catalog {catalog}
 ```
 
 Commands available:
-- `dcam claude context` — Load context from recent sessions
+- `dcam memory index "<task terms>" --scope "<task-id>" --limit 5 --json` — Select metadata when supported
+- `dcam memory recall "<selected handle>"` — Retrieve a matching record
+- `dcam memory context --session-id "<session-id>"` — Load only that session
 - `dcam claude search "query"` — Search across all session history
 - `dcam claude list` — List all synced sessions
-- `dcam claude recall <session-id>` — Replay a specific session
+- `dcam claude recall <session-id>` — Replay a specific relevant session when requested
 """
     if claude_md.exists():
         existing = claude_md.read_text()

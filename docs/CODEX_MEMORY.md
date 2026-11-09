@@ -1,6 +1,8 @@
 # Shared Claude and Codex memory
 
-Codex can reuse the existing DCAM store without migrating or duplicating it.
+Codex reuses the shared DCAM store for matching legacy and cross-project records.
+New project/task/session memories live in the repository-local `.dcam/` store,
+without migrating or duplicating the shared archive.
 This user's local setup was established on 2026-11-05:
 
 - Global startup instructions: `/Users/zyiqin/.codex/AGENTS.md`.
@@ -21,8 +23,10 @@ point. Do not blindly copy absolute paths, account defaults, or credentials.
 Codex handoffs must be explicitly persisted to DCAM; Claude-specific hooks do
 not establish automatic Codex transcript persistence.
 
-The startup guide requires reading both memory indexes, listing central records,
-and retrieving relevant topic memories. Authorized dev assignments must explicitly
+The startup guide now uses selective project/task retrieval: confirm the project
+store, inspect at most five matching metadata records, and recall only selected
+handoffs and relevant topic memories. Broad index reads and central listings are
+not mandatory. See `MEMORY_SCOPING.md` for scope and persistence rules. Authorized dev assignments must explicitly
 carry that bootstrap and request an acknowledgement of loaded sources, including
 fresh-context agents. For independent remote hosts or alternate Codex profiles,
 provide relevant excerpts rather than assuming laptop paths are available.

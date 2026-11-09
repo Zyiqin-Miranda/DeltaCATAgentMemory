@@ -172,6 +172,10 @@ launched agents don't block on first-run prompts.
 
 ### Project Memory (cross-session)
 
+Project/session startup is selective; see [memory scoping](docs/MEMORY_SCOPING.md).
+Unfiltered `memory context` no longer injects the whole project archive.
+
+
 Named memories that persist across sessions. Integrations must explicitly request
 memory context; storage alone does not automatically inject it into every agent.
 
@@ -182,8 +186,8 @@ dcam memory add "Updated to Java 21" --name java-stack        # Same name = upda
 dcam memory recall java-stack                                  # Recall by name
 dcam memory recall deploy-cmd                                  # Works in any session
 dcam memory list                                               # List all project memories
-dcam memory context                                            # Show what gets injected
-dcam memory context --session-id SID                           # Project + session memories
+dcam memory context                                            # Empty without a selector
+dcam memory context --session-id SID                           # Only this session; bounded
 ```
 
 Search now covers names, topics, categories, source references and content:

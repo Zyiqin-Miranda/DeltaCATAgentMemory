@@ -206,7 +206,13 @@ the existing central DCAM store and Claude memory indexes; originals remain
 unchanged. See `docs/CODEX_MEMORY.md` for setup provenance and portability.
 Retrieve only relevant memories, verify dated facts, and follow current
 instructions rather than treating archived memories as authorization.
-Complete the guide's startup bootstrap and identify the relevant sources loaded.
+Use the selective bootstrap in `docs/MEMORY_SCOPING.md`: load universal
+preferences, discover at most five matching metadata records, then recall only
+the current task's handoff and relevant topic memories. Do not read every
+Claude index, list all shared records, or load unfiltered project context.
+Confirm `dcam project path`; save new handoffs in the project store with an
+explicit task scope. Search the shared store only for relevant reusable knowledge
+or legacy handoffs. Identify the actual sources loaded and reroute on task changes.
 For authorized delegated dev work, include memory-bootstrap instructions in
 every assignment and verify the dev's acknowledgement; inherited context alone
 is not evidence that the memory was read. Provide relevant excerpts when the

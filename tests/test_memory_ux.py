@@ -166,7 +166,8 @@ def test_source_and_supersession_round_trip_and_context_warnings(store):
     report = memory_record(old, store.read_memories())
     assert report["superseded_by"] == [new.memory_uid]
     assert new.supersedes_uid == old.memory_uid
-    assert "SUPERSEDED BY" in store.get_session_context()
+    assert store.get_session_context() == ""
+    assert "SUPERSEDED BY" in render_memory(old, store.read_memories())
     assert "source=old.md" in render_memory(old)
     with pytest.raises(ValueError, match="cannot supersede itself"):
         store.add_project_memory("bad", name="old", supersedes="old")
@@ -313,7 +314,8 @@ def test_mcp_memory_tools_and_chunk_handles(store, tmp_path, monkeypatch):
     assert memory.memory_uid in stored
     assert memory.memory_uid in mcp_server.dcam_search_memories("allowlist")
     assert "source=code.md" in mcp_server.dcam_recall_memory(memory.memory_uid)
-    assert "updated=" in mcp_server.dcam_project_memory()
+    assert "Select a session" in mcp_server.dcam_project_memory()
+    assert "updated=" in mcp_server.dcam_recall_memory(memory.memory_uid)
     path = tmp_path / "guide.md"
     path.write_text("# Root\n## Topic\nbody\n")
     assert "#" in mcp_server.dcam_compact(str(path))

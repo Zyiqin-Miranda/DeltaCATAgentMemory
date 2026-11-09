@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# DCAM pre-commit hook: regenerate the managed CLAUDE.md / AGENTS.md
+# sections when any committed DCAM JSON file is staged. Auto-stages the
+# regenerated markdown so it lands in the same commit.
+#
+# Skip with: git commit --no-verify
+
+set -e
+
+# Find the repo root + dcam dir. The hook may be invoked from any cwd.
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+if [[ -z "$REPO_ROOT" ]]; then
+    exit 0
+fi
+DCAM_DIR="$REPO_ROOT/.dcam"
+if [[ ! -d "$DCAM_DIR" ]]; then
+    exit 0
+fi
+
+# No-op unless one of the committable JSON files is staged.
+STAGED=$(git diff --cached --name-only --diff-filter=ACM | \
+         grep -E '^\.dcam/(decisions|lessons|sessions|critical_points|review_requests|reviews|handoffs|specs)\.json$' || true)
+if [[ -z "$STAGED" ]]; then
+    exit 0
+fi
+
+# Find a dcam binary; if none, warn and let the commit proceed unchanged.
+DCAM_BIN=$(command -v dcam 2>/dev/null || true)
+if [[ -z "$DCAM_BIN" ]]; then
+    echo "[dcam pre-commit] dcam CLI not found on PATH; skipping" \
+         "auto-persist of CLAUDE.md/AGENTS.md." >&2
+    exit 0
+fi
+
+# Regenerate only files that already have DCAM markers (target=auto).
+OUTPUT=$("$DCAM_BIN" --root "$DCAM_DIR" tmux persist --target auto \
+                  --project "$REPO_ROOT" 2>&1) || {
+    echo "[dcam pre-commit] persist failed:" >&2
+    echo "$OUTPUT" >&2
+    echo "[dcam pre-commit] commit aborted. Skip with --no-verify." >&2
+    exit 1
+}
+
+# Re-stage any markdown that changed.
+for md in CLAUDE.md AGENTS.md; do
+    if [[ -f "$REPO_ROOT/$md" ]]; then
+        if ! git -C "$REPO_ROOT" diff --quiet -- "$md" 2>/dev/null; then
+            git -C "$REPO_ROOT" add "$md"
+            echo "[dcam pre-commit] auto-staged $md"
+        fi
+    fi
+done
+
+exit 0

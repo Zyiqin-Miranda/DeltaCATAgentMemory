@@ -1,0 +1,6 @@
+# Local-only DCAM tables (large, ephemeral, may contain debugging chatter).
+tables/
+
+# Working files for the search backend, etc.
+.cache/
+*.tmp

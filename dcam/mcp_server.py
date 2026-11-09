@@ -54,11 +54,10 @@ def dcam_store_memory(content: str, type: str = "semantic",
 
 
 @mcp.tool()
-def dcam_project_memory() -> str:
-    """Get all project memories that persist across sessions.
-    Included when the caller's integration requests project context."""
-    ctx = _store.get_session_context()
-    return ctx if ctx else "No project memories stored."
+def dcam_project_memory(session_id: Optional[str] = None) -> str:
+    """Get bounded context for one session; use search/recall for project knowledge."""
+    ctx = _store.get_session_context(session_id)
+    return ctx if ctx else "No matching context. Select a session or search and recall relevant memories."
 
 
 @mcp.tool()

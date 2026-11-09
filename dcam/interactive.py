@@ -156,11 +156,13 @@ def _build_context_prompt(title: str, msgs: List[ChatMessage]) -> Optional[str]:
     parts = [AGENT_INSTRUCTIONS, "\n---\n"]
 
     if msgs:
-        # Inject project memories first
+        # Resume only the selected session's memory, not the project archive.
         try:
             from dcam.store import DeltaStore
             s = DeltaStore()
-            project_ctx = s.get_session_context()
+            session_ids = {m.session_id for m in msgs}
+            project_ctx = (s.get_session_context(next(iter(session_ids)))
+                           if len(session_ids) == 1 else "")
             if project_ctx:
                 parts.append(project_ctx)
                 parts.append("---\n")
