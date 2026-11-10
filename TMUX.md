@@ -425,7 +425,7 @@ cd /path/to/your-project
 dcam claude init
 
 # 2. Create the tmux session and the manager window.
-dcam tmux start myproject --launch
+dcam tmux start myproject --brief "Build the session feature" --launch
 
 # 3. Spawn two dev windows, each with its own task.
 dcam tmux dev myproject auth "Add OAuth refresh-token rotation" --launch
@@ -438,8 +438,16 @@ tmux attach -t myproject
 dcam tmux review myproject --launch
 ```
 
-That's it. The manager and devs each have a Claude Code session pre-loaded
-with their role prompt and (for devs) their task brief.
+The manager and devs receive their role instructions and an initial task prompt.
+`--brief` starts the manager with a concrete objective. Without it, the manager
+uses an objective already provided or asks for one before assigning work.
+
+Follow [the manager dispatch SOP](project-manager-dispatch.sop.md): dispatch
+two to three useful independent workers early when capacity permits, reserve
+capacity for the manager and reviewer, and refill slots when prerequisites
+are verified. Give concurrent writers separate worktrees or exclusive paths.
+`--launch` is required to start the agent; without it, DCAM prints a manual
+launch command.
 
 ## Communication channels
 

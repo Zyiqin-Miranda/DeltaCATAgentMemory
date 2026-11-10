@@ -523,6 +523,13 @@ If `bd` is not available, dcam works in standalone mode.
 
 ## Multi-Agent Orchestration
 
+Project managers follow [the dispatch SOP](project-manager-dispatch.sop.md):
+start two to three independent workers early when capacity permits, count
+managers and reviewers against runtime limits, and refill available capacity
+as dependencies become ready. Each worker receives scoped memory instructions,
+exclusive write ownership, and acceptance checks; the manager verifies results
+before integration. Current user authorization and runtime rules govern dispatch.
+
 Two complementary modes ship in dcam:
 
 **1. Beads-driven task queue** — `dcam orchestrate` polls `bd ready` for
@@ -542,7 +549,7 @@ specs, peer messaging, and dep tracking:
 
 ```bash
 # Spawn the team (single-host mode):
-dcam tmux start <session> --launch
+dcam tmux start <session> --brief "<task objective>" --launch
 dcam tmux dev <session> <slug> "<brief>" --launch
 dcam tmux review <session> --launch
 

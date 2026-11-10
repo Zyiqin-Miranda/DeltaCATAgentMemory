@@ -19,6 +19,7 @@ Usage:
 """
 
 import argparse
+import shlex
 import json
 import os
 import subprocess
@@ -473,14 +474,17 @@ def cmd_tmux_start(args):
         # Pre-accept Claude's first-run prompts so the manager pane
         # doesn't get stuck on the theme picker / trust dialog.
         claude_code.bootstrap_claude_first_run(project_path)
-    cmd = tmux.build_manager_launch_cmd(args.claude_bin) if args.launch else None
+    launch_cmd = tmux.build_manager_launch_cmd(args.claude_bin, session=args.session,
+                                              project_path=project_path,
+                                              brief=getattr(args, "brief", None))
+    cmd = launch_cmd if args.launch else None
     name = tmux.start_session(args.session, project_path, manager_cmd=cmd)
     print(f"✓ tmux session '{name}' ready (window: manager)")
     if args.launch:
         print(f"  ✓ launched manager agent in {name}:manager")
     else:
-        print(f"  To start the manager agent: tmux send-keys -t {name}:manager "
-              f"'{tmux.build_manager_launch_cmd(args.claude_bin)}' Enter")
+        print(f"  To start the manager agent: tmux send-keys -t {shlex.quote(name + ':manager')} "
+              f"{shlex.quote(launch_cmd)} Enter")
     print(f"  Attach with: tmux attach -t {name}")
 
 
@@ -543,8 +547,8 @@ def cmd_tmux_dev(args):
     # on the window name itself, but with --launch it would re-send the
     # claude command into an already-running pane. Refuse that case unless
     # --force.
-    cmd = (tmux.build_dev_launch_cmd(slug, brief, args.claude_bin)
-           if args.launch else None)
+    launch_cmd = tmux.build_dev_launch_cmd(slug, brief, args.claude_bin, session=args.session)
+    cmd = launch_cmd if args.launch else None
     if existing_window and args.launch and not args.force:
         # Don't re-send the claude command into an existing pane.
         cmd = None
@@ -582,8 +586,8 @@ def cmd_tmux_dev(args):
                   f"Check `bd doctor`.")
 
     if not args.launch and not existing_window:
-        print(f"  To start the dev agent: tmux send-keys -t {target} "
-              f"'{tmux.build_dev_launch_cmd(slug, brief, args.claude_bin)}' Enter")
+        print(f"  To start the dev agent: tmux send-keys -t {shlex.quote(target)} "
+              f"{shlex.quote(launch_cmd)} Enter")
 
 
 def cmd_tmux_review(args):
@@ -598,8 +602,9 @@ def cmd_tmux_review(args):
     store = get_store(args.namespace, args.search_backend, args.catalog,
                       getattr(args, "branch", "main"), getattr(args, "root", None))
     extra = bootstrap_context(store) if not args.no_bootstrap else None
-    cmd = (tmux.build_reviewer_launch_cmd(args.claude_bin, extra_context=extra)
-           if args.launch else None)
+    launch_cmd = tmux.build_reviewer_launch_cmd(args.claude_bin, extra_context=extra,
+                                               session=args.session)
+    cmd = launch_cmd if args.launch else None
     target = tmux.spawn_review_window(args.session, project_path, review_cmd=cmd)
     print(f"✓ review window '{target}' ready")
     if args.launch:
@@ -611,8 +616,8 @@ def cmd_tmux_review(args):
             print(f"  Bootstrapped reviewer with {crit_count} critical points, "
                   f"{find_count} prior findings, {queue_count} pending requests.")
     else:
-        print(f"  To start the reviewer: tmux send-keys -t {target} "
-              f"'{tmux.build_reviewer_launch_cmd(args.claude_bin)}' Enter")
+        print(f"  To start the reviewer: tmux send-keys -t {shlex.quote(target)} "
+              f"{shlex.quote(launch_cmd)} Enter")
 
 
 def cmd_tmux_status(args):
@@ -2271,6 +2276,8 @@ def main():
                           help="Auto-launch the manager agent in the window")
     tx_start.add_argument("--claude-bin", default="claude",
                           help="Path/name of the claude binary")
+    tx_start.add_argument("--brief", default=None,
+                          help="Assigned task objective used to start manager work immediately")
 
     tx_dev = txsub.add_parser("dev", help="Spawn a dev window")
     tx_dev.add_argument("session", help="tmux session name")

@@ -217,3 +217,13 @@ For authorized delegated dev work, include memory-bootstrap instructions in
 every assignment and verify the dev's acknowledgement; inherited context alone
 is not evidence that the memory was read. Provide relevant excerpts when the
 agent cannot access the laptop's memory paths.
+
+## Project manager dispatch
+
+When managing an authorized multi-agent task, follow
+[project-manager-dispatch.sop.md](project-manager-dispatch.sop.md). Decompose
+independent work early and start two to three useful workers when capacity
+permits. Count managers and reviewers against runtime limits, give each worker
+a scoped brief and exclusive write ownership, and refill capacity as inputs
+become ready. Independently verify results before integration. Follow current
+user authorization and runtime delegation rules.

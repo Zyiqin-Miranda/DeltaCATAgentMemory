@@ -24,6 +24,7 @@ import shlex
 import shutil
 import subprocess
 from typing import List, Optional
+from dcam.manager_policy import MANAGER_DISPATCH_POLICY
 
 
 # --- Role prompts -----------------------------------------------------------
@@ -32,11 +33,13 @@ MANAGER_PROMPT = """You are the MANAGER agent in a multi-agent team coordinated 
 
 Your responsibilities:
 - Hold the high-level project context and make architectural decisions.
-- Decompose work into tasks (use `dcam task create`) labeled `role:dev`.
-- Spawn dev workers with `dcam tmux dev <slug> "<brief>"` for hands-on work.
-- Periodically call `dcam claude context` for a structured view of every dev's
-  recent activity (files touched, commands run, last prompt) and `bd list
-  --label role:dev` for the queue state.
+- Decompose work into independently owned tasks. `dcam tmux dev` creates/reuses
+  the worker's Beads task; record dependencies instead of duplicating issues.
+- Start ready workers with `dcam tmux dev <session> <slug> "<brief>" --launch
+  --project <worker-worktree>`. Use the active session supplied at startup.
+- Inspect `dcam tmux digest --session <session>` and `dcam tmux status <session>`
+  for the team state. Retrieve only matching task/session evidence rather than
+  replaying every recent conversation.
 - Triage decision requests:
     * `dcam tmux decisions list --status open` — see what devs are waiting on.
     * `dcam tmux decisions show <id>` — full context + options + chain history.
@@ -46,10 +49,10 @@ Your responsibilities:
 - Persist durable decisions and lessons into the project's CLAUDE.md (and/or
   AGENTS.md). The managed sections are auto-regenerated; do not edit them by
   hand. Use `dcam tmux persist --target claude` to refresh.
-- Trigger code review with `dcam tmux review` when a dev's task is in flight
+- Trigger code review with `dcam tmux review <session> --launch` when a dev's task is in flight
   or done. Read the reviewer's `[review]` comments via `bd show <task-id>`.
 - Send guidance / redirections / answers to a specific dev with
-  `dcam tmux msg manager <dev-slug> "<text>"`. This is the canonical
+  `dcam tmux msg manager <dev-slug> "<text>" --session <session>`. This is the canonical
   manager→dev send path: delivered live via tmux send-keys AND persisted
   as a bd comment on the dev's task. Prefer this over `dcam tmux send`
   (which is a raw send-keys wrapper); `msg` survives bd lookups and
@@ -59,7 +62,7 @@ Your responsibilities:
   manager's own pane, or arbitrary text not addressed to a dev slug).
 
 You do NOT write production code yourself. You delegate.
-"""
+""" + MANAGER_DISPATCH_POLICY
 
 DEV_PROMPT_TEMPLATE = """You are a DEV agent working on task slug `{slug}`.
 
@@ -67,6 +70,9 @@ Task brief:
 {brief}
 
 Your responsibilities:
+- Read the assigned project's instructions and scoped-memory sources; report
+  the actual files/records read. Follow the brief's task ID, owned paths and
+  branch/worktree, dependencies, allowed actions and acceptance checks.
 - Implement the task. Write code, run tests, commit when ready.
 - Post milestone updates with `dcam tmux update {slug} "<one-line status>"`
   on real progress (started, blocked, ready-for-review, done).
@@ -85,13 +91,13 @@ ambiguous requirement):
 
 When your work depends on or affects another dev:
 - `dcam tmux dep <their-slug> {slug}` — declare you're blocked by them.
-- `dcam tmux msg {slug} <their-slug> "<text>"` — message them directly
+- `dcam tmux msg {slug} <their-slug> "<text>" --session <session>` — message them directly
   (delivered live via tmux + persisted as a bd comment on their task).
 - `dcam tmux deps {slug}` — see open dev tasks at a glance.
 
 **The manager talks to you the same way.** When the manager sends
 guidance, redirection, or answers to your `ask`, it arrives via
-`dcam tmux msg manager {slug} "<text>"` — visible in your pane as a
+  `dcam tmux msg manager {slug} "<text>" --session <session>` — visible in your pane as a
 fresh prompt. Watch for messages there before continuing each turn.
 
 When you discover something worth remembering across sessions:
@@ -346,22 +352,40 @@ def list_dev_windows(session: str) -> List[str]:
     return [w[4:] for w in list_windows(session) if w.startswith("dev-")]
 
 
-def build_dev_launch_cmd(slug: str, brief: str, claude_bin: str = "claude") -> str:
+def build_dev_launch_cmd(slug: str, brief: str, claude_bin: str = "claude",
+                         session: Optional[str] = None) -> str:
     """Build the shell command that a dev window runs to start its agent.
 
-    The agent is launched non-interactively with the dev role prompt as
-    `--append-system-prompt`, then keeps the shell open for follow-up.
+    The agent receives the dev role via `--append-system-prompt` and a
+    positional task kickoff, then remains interactive for follow-up.
     """
     prompt = DEV_PROMPT_TEMPLATE.format(slug=slug, brief=brief)
-    return f"{claude_bin} --append-system-prompt {shlex.quote(prompt)}"
+    if session:
+        prompt += f"\nActive tmux session: {session}\n"
+    kickoff = "Begin the assigned task now: load its scoped instructions, report the memory receipt, and start the authorized work."
+    return f"{shlex.quote(claude_bin)} --append-system-prompt {shlex.quote(prompt)} {shlex.quote(kickoff)}"
 
 
-def build_manager_launch_cmd(claude_bin: str = "claude") -> str:
-    return f"{claude_bin} --append-system-prompt {shlex.quote(MANAGER_PROMPT)}"
+def build_manager_launch_cmd(claude_bin: str = "claude",
+                             session: Optional[str] = None,
+                             project_path: Optional[str] = None,
+                             brief: Optional[str] = None) -> str:
+    prompt = MANAGER_PROMPT
+    if session:
+        prompt += f"\nActive tmux session: {session}\n"
+    if project_path:
+        prompt += f"\nProject root: {project_path}\n"
+    kickoff = (
+        f"Manage this assigned task: {brief}\nBegin scoped bootstrap, decomposition and independent dispatch now."
+        if brief else
+        "Begin manager setup for this project and session. Use the task objective already provided; if none is available, request the objective before dispatching work."
+    )
+    return f"{shlex.quote(claude_bin)} --append-system-prompt {shlex.quote(prompt)} {shlex.quote(kickoff)}"
 
 
 def build_reviewer_launch_cmd(claude_bin: str = "claude",
-                              extra_context: Optional[str] = None) -> str:
+                              extra_context: Optional[str] = None,
+                              session: Optional[str] = None) -> str:
     """Build the reviewer launch command, optionally with bootstrapped context.
 
     `extra_context` (typically produced by `dcam.reviews.bootstrap_context`)
@@ -372,4 +396,7 @@ def build_reviewer_launch_cmd(claude_bin: str = "claude",
     full_prompt = REVIEWER_PROMPT
     if extra_context:
         full_prompt = full_prompt.rstrip() + "\n\n" + extra_context
-    return f"{claude_bin} --append-system-prompt {shlex.quote(full_prompt)}"
+    if session:
+        full_prompt += f"\nActive tmux session: {session}\n"
+    kickoff = "Begin reviewing the team's pending assigned requests now; report readiness if no request is pending."
+    return f"{shlex.quote(claude_bin)} --append-system-prompt {shlex.quote(full_prompt)} {shlex.quote(kickoff)}"
